@@ -145,11 +145,11 @@ module ServerSocket =
     let acceptLoop (handler: Socket -> FIO<unit, SocketError>) (serverSocket: ServerSocket) =
         acceptLoopWith DefaultMaxConcurrentHandlers handler serverSocket
 
-    /// Gets the configuration a server socket was created with.
+    /// The configuration the given server socket was created with.
     let getConfig (serverSocket: ServerSocket) =
         serverSocket.Config
 
-    /// Gets the local endpoint a server socket is bound to.
+    /// Returns an effect that yields the local endpoint the given server socket is bound to.
     let getLocalEndPoint (serverSocket: ServerSocket) =
         FIO.attempt (fun () -> serverSocket.NetSocket.LocalEndPoint) SocketError.fromException
 

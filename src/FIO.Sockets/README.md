@@ -10,7 +10,6 @@ effects — connections are scoped and released for you, and failures surface as
 
 - **Client connections** — `SocketClient.withConnectionTo` / `withConnection` scope a socket's lifetime
 - **Server** — `ServerSocket.bind` / `accept` / `close` to serve clients
-- **Connection pooling** — reuse connections under load
 - **Custom codecs** — send and receive typed messages, not just strings
 
 ## Install
@@ -52,9 +51,12 @@ let server = fio {
 ## Errors
 
 Operations fail with a typed `SocketError` — including `ConnectionFailed`, `ConnectionClosed`,
-`SendFailed`, `ReceiveFailed`, `TimeoutError`, `BindFailed`, `AcceptFailed`, `PoolExhausted`,
-`CodecError`, `GeneralError` — with `SocketError.fromException` / `SocketError.toException`
-to bridge raw exceptions.
+`SendFailed`, `ReceiveFailed`, `TimeoutError`, `BindFailed`, `AcceptFailed`, `CodecError`,
+`GeneralError` — with `SocketError.fromException` / `SocketError.toException` to bridge raw
+exceptions.
+
+Connection pooling is not implemented yet: `SocketPoolConfig` and the `PoolExhausted` / `PoolClosed`
+error cases are reserved for it and are not produced by any current operation.
 
 ## Links
 

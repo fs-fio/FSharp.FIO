@@ -109,7 +109,7 @@ and private FiberContextState =
     | Completed = 1
     | Interrupted = 2
 
-and [<Sealed>] internal FiberContext() =
+and [<Sealed; AllowNullLiteral>] internal FiberContext() =
     let id = Guid.NewGuid()
     let mutable state = int FiberContextState.Running
 
@@ -123,6 +123,32 @@ and [<Sealed>] internal FiberContext() =
 
     [<VolatileField>]
     let mutable registrations: ConcurrentBag<IDisposable> = null
+
+    // One signal that interrupts every scoped child. Deliberately separate from cancelSource, whose
+    // token is handed to user code by FIO.cancellationToken: a fiber finishing normally must not
+    // present itself as cancelled.
+    [<VolatileField>]
+    let mutable childScope: CancellationTokenSource = null
+
+    // Set on a scoped child so it can tell its parent it has finished unwinding.
+    [<VolatileField>]
+    let mutable parent: FiberContext = null
+
+    // Scoped children that have not yet unwound.
+    [<VolatileField>]
+    let mutable outstanding = 0
+
+    // This fiber's effect has finished and a result is waiting on its children.
+    [<VolatileField>]
+    let mutable completing = 0
+
+    [<VolatileField>]
+    let mutable published = 0
+
+    let mutable pendingValue = Unchecked.defaultof<Result<obj, obj>>
+
+    [<VolatileField>]
+    let mutable pendingQueue: MailboxQueue<WorkItem> = null
 
     [<VolatileField>]
     let mutable disposed = 0
@@ -170,6 +196,25 @@ and [<Sealed>] internal FiberContext() =
                 return true
             })
 
+    member internal _.ChildScopeToken =
+        (initIfNull &childScope (fun () -> new CancellationTokenSource())).Token
+
+    member internal _.RegisterChild () =
+        Interlocked.Increment &outstanding |> ignore
+
+    member internal _.AttachTo (newParent: FiberContext) =
+        parent <- newParent
+        newParent.RegisterChild()
+
+    member private _.CancelChildScope () =
+        match Volatile.Read &childScope with
+        | null -> ()
+        | source ->
+            try
+                source.Cancel(throwOnFirstException = false)
+            with :? ObjectDisposedException ->
+                ()
+
     member internal this.AddRegistration (registration: IDisposable) =
         let bag = initIfNull &registrations (fun () -> ConcurrentBag<IDisposable>())
         bag.Add registration
@@ -190,34 +235,55 @@ and [<Sealed>] internal FiberContext() =
     member internal _.IsTerminal () =
         Volatile.Read &state <> int FiberContextState.Running
 
+    member private this.Publish value =
+        transitionFrom &state (int FiberContextState.Running) (int FiberContextState.Completed) |> ignore
+        this.DisposeRegistrations()
+        resultSource.TrySetResult value |> ignore
+        this.InvokeOnTerminal()
+
+        match Volatile.Read &pendingQueue with
+        | null -> ()
+        | queue ->
+            let blocked = Volatile.Read &blockingWorkItemQueue
+            if not (isNull blocked) && blocked.Count > 0 then
+                this.RescheduleBlockingWorkItems queue |> ignore
+
+        match Volatile.Read &parent with
+        | null -> ()
+        | scope -> scope.OnChildUnwound()
+
+    member private this.TryFinish () =
+        if Volatile.Read &completing = 1
+           && Volatile.Read &outstanding = 0
+           && tryClaim &published then
+            this.Publish pendingValue
+
+    member private this.OnChildUnwound () =
+        Interlocked.Decrement &outstanding |> ignore
+        this.TryFinish()
+
     member internal this.Complete value =
-        if tryTransition &state (int FiberContextState.Running) (int FiberContextState.Completed) then
-            this.DisposeRegistrations()
-            resultSource.TrySetResult value |> ignore
-            this.InvokeOnTerminal()
+        this.CompleteInternal(value, null)
 
     member internal this.CompleteAndReschedule (value, activeWorkItemQueue) =
-        let oldState =
-            transitionFrom &state (int FiberContextState.Running) (int FiberContextState.Completed)
-        if oldState = int FiberContextState.Running ||
-            oldState = int FiberContextState.Interrupted then
-            this.DisposeRegistrations()
-            resultSource.TrySetResult value |> ignore
-            this.InvokeOnTerminal()
+        this.CompleteInternal(value, activeWorkItemQueue)
+        ValueTask.CompletedTask
 
-            let queue = Volatile.Read &blockingWorkItemQueue
-            if not (isNull queue) && queue.Count > 0 then
-                ValueTask(this.RescheduleBlockingWorkItems activeWorkItemQueue)
-            else
-                ValueTask.CompletedTask
-        else
-            ValueTask.CompletedTask
+    member private this.CompleteInternal (value, activeWorkItemQueue: MailboxQueue<WorkItem>) =
+        pendingValue <- value
+        Volatile.Write(&pendingQueue, activeWorkItemQueue)
+
+        if Interlocked.Exchange(&completing, 1) = 0 then
+            this.CancelChildScope()
+            this.TryFinish()
 
     member internal this.Interrupt (?cause, ?message) =
         let cause = defaultArg cause ExplicitInterrupt
         let message = defaultArg message "Fiber was interrupted."
-        if tryTransition &state (int FiberContextState.Running) (int FiberContextState.Interrupted) then
+        if Volatile.Read &completing = 0
+           && tryTransition &state (int FiberContextState.Running) (int FiberContextState.Interrupted) then
             cancelSource.Cancel(throwOnFirstException = false)
+            this.CancelChildScope()
             this.DisposeRegistrations()
             let interruptError = Error(FiberInterruptedException(id, cause, message) :> obj)
             resultSource.TrySetResult interruptError |> ignore
@@ -254,6 +320,10 @@ and [<Sealed>] internal FiberContext() =
             if disposing then
                 cancelSource.Dispose()
 
+                match Volatile.Read &childScope with
+                | null -> ()
+                | source -> source.Dispose()
+
     override this.Finalize () =
         this.Dispose false
 
@@ -263,9 +333,6 @@ and [<Sealed>] internal FiberContext() =
             this.Dispose true
             GC.SuppressFinalize this
 
-// Signals once when the first observed child fails (or is interrupted), or when the last child
-// succeeds. Only successes decrement, so the counter reaches zero iff every child succeeded —
-// a final "all done" signal can never race past an unclaimed failure.
 and [<Sealed>] internal JoinAllLatch(count: int, signal: unit -> unit) =
 
     let mutable remaining = count
@@ -497,7 +564,7 @@ and FIO<'A, 'E> =
     | Action of func: (unit -> 'A) * onError: (exn -> 'E)
     | WriteChan of value: 'A * channel: Channel<'A>
     | ReadChan of channel: Channel<'A>
-    | ForkEffect of effect: FIO<obj, obj> * fiber: obj * fiberContext: FiberContext
+    | ForkEffect of effect: FIO<obj, obj> * fiber: obj * fiberContext: FiberContext * daemon: bool
     | JoinFiber of fiberContext: FiberContext
     | JoinFirst of fiberContexts: FiberContext list
     | JoinAllFailFast of fiberContexts: FiberContext[]
@@ -521,10 +588,23 @@ and FIO<'A, 'E> =
     member this.Ensuring (finalizer: FIO<unit, 'E>) : FIO<'A, 'E> =
         OnFinalize(this, finalizer.UpcastBoth())
 
-    /// Returns an effect that runs this effect on a new fiber, yielding the fiber's handle.
+    /// Returns an effect that runs this effect on a new fiber, yielding the fiber immediately.
+    /// The forked fiber is scoped to this one: when this fiber finishes it interrupts the child and
+    /// waits for it to unwind, so every finalizer in the subtree has run before this fiber's result
+    /// becomes observable. Await the child here if you need its result. Use ForkDaemon for a fiber that
+    /// should outlive its parent.
     member this.Fork<'E1> () : FIO<Fiber<'A, 'E>, 'E1> =
-        let fiber = new Fiber<'A, 'E>()
-        ForkEffect(this.UpcastBoth(), fiber, fiber.Context)
+        Suspend(fun () ->
+            let fiber = new Fiber<'A, 'E>()
+            ForkEffect(this.UpcastBoth(), fiber, fiber.Context, false))
+
+    /// Returns an effect that runs this effect on a new unscoped fiber, yielding the fiber immediately.
+    /// Unlike Fork, the forked fiber is independent of this one: it is neither interrupted nor awaited
+    /// when this fiber finishes, so its lifetime — and its finalizers — become the caller's to manage.
+    member this.ForkDaemon<'E1> () : FIO<Fiber<'A, 'E>, 'E1> =
+        Suspend(fun () ->
+            let fiber = new Fiber<'A, 'E>()
+            ForkEffect(this.UpcastBoth(), fiber, fiber.Context, true))
 
     /// Returns an effect that applies the given function to this effect's success value.
     member this.Map<'A1> (mapper: 'A -> 'A1) : FIO<'A1, 'E> =
@@ -659,8 +739,8 @@ and FIO<'A, 'E> =
             WriteChan(value :> obj, channel.Upcast())
         | ReadChan channel ->
             ReadChan(channel.Upcast())
-        | ForkEffect(effect, fiber, fiberContext) ->
-            ForkEffect(effect, fiber, fiberContext)
+        | ForkEffect(effect, fiber, fiberContext, daemon) ->
+            ForkEffect(effect, fiber, fiberContext, daemon)
         | JoinFiber fiberContext ->
             JoinFiber fiberContext
         | JoinFirst fiberContexts ->
@@ -705,8 +785,8 @@ and FIO<'A, 'E> =
             WriteChan(value, channel)
         | ReadChan channel ->
             ReadChan channel
-        | ForkEffect(effect, fiber, fiberContext) ->
-            ForkEffect(effect, fiber, fiberContext)
+        | ForkEffect(effect, fiber, fiberContext, daemon) ->
+            ForkEffect(effect, fiber, fiberContext, daemon)
         | JoinFiber fiberContext ->
             JoinFiber fiberContext
         | JoinFirst fiberContexts ->
@@ -751,8 +831,8 @@ and FIO<'A, 'E> =
             WriteChan(value :> obj, channel.Upcast())
         | ReadChan channel ->
             ReadChan(channel.Upcast())
-        | ForkEffect(effect, fiber, fiberContext) ->
-            ForkEffect(effect, fiber, fiberContext)
+        | ForkEffect(effect, fiber, fiberContext, daemon) ->
+            ForkEffect(effect, fiber, fiberContext, daemon)
         | JoinFiber fiberContext ->
             JoinFiber fiberContext
         | JoinFirst fiberContexts ->

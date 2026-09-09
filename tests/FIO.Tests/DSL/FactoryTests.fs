@@ -1,10 +1,10 @@
 module FIO.Tests.FactoryTests
 
+open FIO.Tests.Utilities
 open FIO.Tests.Utilities.FsCheckProperties
 
 open FIO.DSL
 open FIO.Runtime
-open FIO.Runtime.Direct
 open FIO.Runtime.Polling
 open FIO.Runtime.Signaling
 open FIO.Runtime.WorkStealing
@@ -17,18 +17,8 @@ open System.Threading
 open System.Diagnostics
 open System.Threading.Tasks
 
-let private runtimes () =
-    [
-        new DirectRuntime() :> FIORuntime
-        new PollingRuntime() :> FIORuntime
-        new WorkStealingRuntime() :> FIORuntime
-    ]
-
-let private testAllRuntimes name (f: FIORuntime -> unit) =
-    testList name [ for rt in runtimes () -> testCase (rt.GetType().Name) (fun () -> f rt) ]
-
 let private stressTestAllRuntimes name (f: FIORuntime -> unit) =
-    testList name [ for rt in runtimes () -> stressTestCase (rt.GetType().Name) (fun () -> f rt) ]
+    testList name [ for rt in allRuntimes () -> stressTestCase (rt.GetType().Name) (fun () -> f rt) ]
 
 [<Tests>]
 let factoryTests =
@@ -363,13 +353,16 @@ let factoryTests =
                     let throwingOnError: exn -> exn = fun _ -> raise (Exception "onError threw")
                     let effect = FIO.awaitTask faulting throwingOnError
 
-                    let result =
-                        runtime.Run(effect).UnsafeError()
-
-                    Expect.stringContains
-                        result.Message
-                        "task boom"
-                        $"{runtime.GetType().Name}: throwing onError must not crash; raw task error should surface")
+                    match runtime.Run(effect).UnsafeResult() with
+                    | Interrupted ex ->
+                        match ex.cause with
+                        | Defect defect ->
+                            Expect.stringContains
+                                defect.Message
+                                "task boom"
+                                $"{runtime.GetType().Name}: throwing onError must not crash; the raw task error should surface as the defect"
+                        | other -> failtest $"{runtime.GetType().Name}: expected a Defect cause but got {other}"
+                    | other -> failtest $"{runtime.GetType().Name}: expected Interrupted but got {other}")
 
             testPropertyWithConfig fsCheckConfig "awaitAsync - returns async result"
             <| fun (runtime: FIORuntime, value: int) ->
@@ -906,7 +899,7 @@ let factoryTests =
 
             testCase "forEach - stack-safe over 10000 items"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let xs = [ 1 .. 10000 ]
                     let effect = FIO.forEach xs FIO.succeed
 
@@ -964,7 +957,7 @@ let factoryTests =
 
             testCase "forEachDiscard - stack-safe over 10000 items"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let xs = [ 1 .. 10000 ]
                     let effect = FIO.forEachDiscard xs (fun _ -> FIO.unit ())
 
@@ -1005,7 +998,7 @@ let factoryTests =
 
             testCase "forEachPar - fails with one of the errors and interrupts peers"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let mutable peerCompleted = 0
                     let started = new ManualResetEventSlim(false)
                     let failureItems = 5
@@ -1037,7 +1030,7 @@ let factoryTests =
 
             testCase "forEachPar - fails fast even when an earlier peer never terminates"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let sentinel = -1
 
                     let effect =
@@ -1170,7 +1163,7 @@ let factoryTests =
 
             testCase "replicateFIO - stack-safe over 10000 iterations"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let effect = FIO.replicateFIO 10000 (FIO.unit ())
 
                     let result =
@@ -1238,7 +1231,7 @@ let factoryTests =
 
             testCase "replicateFIODiscard - stack-safe over 10000 iterations"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let effect = FIO.replicateFIODiscard 10000 (FIO.unit ())
 
                     let result =
@@ -1294,7 +1287,7 @@ let factoryTests =
 
             testCase "loop - stack-safe over 10000 iterations"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let effect =
                         FIO.loop 0 (fun s -> s < 10000) ((+) 1) (fun _ -> FIO.unit ())
 
@@ -1353,7 +1346,7 @@ let factoryTests =
 
             testCase "loopDiscard - stack-safe over 10000 iterations"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let effect =
                         FIO.loopDiscard 0 (fun s -> s < 10000) ((+) 1) (fun _ -> FIO.unit ())
 
@@ -1407,7 +1400,7 @@ let factoryTests =
 
             testCase "iterate - stack-safe over 10000 iterations"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let effect =
                         FIO.iterate 0 (fun s -> s < 10000) (fun s -> FIO.succeed (s + 1))
 
@@ -1457,7 +1450,7 @@ let factoryTests =
 
             testCase "mergeAll - stack-safe over 10000 effects"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let effects = [ 1 .. 10000 ] |> List.map FIO.succeed
 
                     let effect = FIO.mergeAll effects 0 (+)
@@ -1536,7 +1529,7 @@ let factoryTests =
 
             testCase "reduceAll - stack-safe over 10000 effects"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let tail = [ 1 .. 9999 ] |> List.map FIO.succeed
                     let effect = FIO.reduceAll (FIO.succeed 0) tail (+)
 
@@ -1622,7 +1615,7 @@ let factoryTests =
 
             testCase "partition - stack-safe over 10000 items"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let xs = [ 1 .. 10000 ]
                     let f x =
                         if x % 2 = 0 then FIO.succeed x
@@ -1682,7 +1675,7 @@ let factoryTests =
 
             testCase "partitionPar - does not interrupt siblings on failure"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let mutable completed = 0
                     let n = 10
                     let f i =
@@ -1749,7 +1742,7 @@ let factoryTests =
 
             testCase "validate - stack-safe over 10000 items"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let xs = [ 1 .. 10000 ]
 
                     let effect = FIO.validate xs (fun x -> FIO.succeed x)
@@ -1805,7 +1798,7 @@ let factoryTests =
 
             testCase "validatePar - does not interrupt siblings on failure"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let mutable completed = 0
                     let n = 10
                     let f i =
@@ -1870,7 +1863,7 @@ let factoryTests =
 
             testCase "collectAllSuccesses - stack-safe over 10000 effects"
             <| fun () ->
-                for runtime in runtimes () do
+                for runtime in allRuntimes () do
                     let effects = [ 1 .. 10000 ] |> List.map FIO.succeed
                     let effect = FIO.collectAllSuccesses effects
 

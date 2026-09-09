@@ -78,10 +78,14 @@ module WebSocketClient =
                 return! connect uri config cancelToken
             }
 
-        FIO.acquireReleaseWith acquire
-            (fun ws -> ws.Close(Net.WebSockets.WebSocketCloseStatus.NormalClosure, "Closing connection")
-                        .CatchAll(logAndSuppress "websocket close"))
-            action
+        let release (ws: WebSocket) =
+            (ws.Close(Net.WebSockets.WebSocketCloseStatus.NormalClosure, "Closing connection")
+                .CatchAll(logAndSuppress "websocket close"))
+                .Ensuring(
+                    (FIO.attempt (fun () -> (ws :> IDisposable).Dispose()) WsError.fromException)
+                        .CatchAll(logAndSuppress "websocket disposal"))
+
+        FIO.acquireReleaseWith acquire release action
 
     /// Connects to the given URL string, runs an action with the open connection, then closes it.
     let withConnectionString<'A> (url: string) (action: WebSocket -> FIO<'A, WsError>) =

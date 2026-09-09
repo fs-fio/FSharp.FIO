@@ -1,12 +1,10 @@
 module FIO.Tests.CETests
 
+open FIO.Tests.Utilities
 open FIO.Tests.Utilities.FsCheckProperties
 
 open FIO.DSL
 open FIO.Runtime
-open FIO.Runtime.Direct
-open FIO.Runtime.Polling
-open FIO.Runtime.WorkStealing
 
 open Expecto
 
@@ -19,16 +17,6 @@ type TestDisposable() =
 
     interface IDisposable with
         member _.Dispose() = disposed <- true
-
-let private runtimes () =
-    [
-        new DirectRuntime() :> FIORuntime
-        new PollingRuntime() :> FIORuntime
-        new WorkStealingRuntime() :> FIORuntime
-    ]
-
-let private testAllRuntimes name (f: FIORuntime -> unit) =
-    testList name [ for rt in runtimes () -> testCase (rt.GetType().Name) (fun () -> f rt) ]
 
 [<Tests>]
 let ceTests =

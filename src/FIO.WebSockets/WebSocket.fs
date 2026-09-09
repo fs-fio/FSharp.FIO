@@ -33,6 +33,18 @@ type WebSocket internal (socket: Net.WebSockets.WebSocket, config: WebSocketConf
     let awaitTask (task: Task<'A>) =
         FIO.awaitTask task WsError.fromException
 
+    // Releases a semaphore permit exactly when the wait actually granted one. A wait that ends
+    // cancelled never took a permit; a wait granted after this fiber has already given up must still
+    // hand it back, or the connection's lock stays held for the life of the socket.
+    let releasePermitWhenGranted (semaphore: SemaphoreSlim) (permit: Task) =
+        permit.ContinueWith(
+            (fun (completed: Task) ->
+                if completed.IsCompletedSuccessfully then
+                    try semaphore.Release() |> ignore
+                    with _ -> ()),
+            TaskContinuationOptions.ExecuteSynchronously)
+        |> ignore
+
     /// Receives the next complete message, using the given cancellation token.
     member _.ReceiveMessage (cancelToken: CancellationToken) =
         fio {
@@ -56,13 +68,13 @@ type WebSocket internal (socket: Net.WebSockets.WebSocket, config: WebSocketConf
             let! lockTask = attempt <| fun () ->
                 receiveLock.WaitAsync effectiveToken
 
-            do! awaitUnitTask lockTask
-
             let bufferSize = config.ReceiveBufferSize
             let buffer = ArrayPool<byte>.Shared.Rent bufferSize
 
             let computation =
                 fio {
+                    do! awaitUnitTask lockTask
+
                     let fragments = ResizeArray<byte>()
                     let mutable endOfMessage = false
                     let mutable messageType = WebSocketMessageType.Text
@@ -113,7 +125,7 @@ type WebSocket internal (socket: Net.WebSockets.WebSocket, config: WebSocketConf
                 fio {
                     do! attempt <| fun () ->
                         ArrayPool<byte>.Shared.Return buffer
-                    do! attempt(fun () -> receiveLock.Release() |> ignore)
+                    do! attempt(fun () -> releasePermitWhenGranted receiveLock lockTask)
                             .CatchAll(logAndSuppress "receiveLock release")
                     do! attempt(fun () -> linkedCts.Dispose())
                             .CatchAll(logAndSuppress "linkedCts disposal")
@@ -167,10 +179,10 @@ type WebSocket internal (socket: Net.WebSockets.WebSocket, config: WebSocketConf
             let! lockTask = attempt <| fun () ->
                 sendLock.WaitAsync effectiveToken
 
-            do! awaitUnitTask lockTask
-
             let computation =
                 fio {
+                    do! awaitUnitTask lockTask
+
                     match frame with
                     | Text text ->
                         let maxByteCount = Encoding.UTF8.GetMaxByteCount text.Length
@@ -205,7 +217,7 @@ type WebSocket internal (socket: Net.WebSockets.WebSocket, config: WebSocketConf
 
             let finalizer =
                 fio {
-                    do! attempt(fun () -> sendLock.Release() |> ignore)
+                    do! attempt(fun () -> releasePermitWhenGranted sendLock lockTask)
                             .CatchAll(logAndSuppress "sendLock release")
                     do! attempt(fun () -> linkedCts.Dispose())
                             .CatchAll(logAndSuppress "linkedCts disposal")
@@ -289,15 +301,17 @@ type WebSocket internal (socket: Net.WebSockets.WebSocket, config: WebSocketConf
             let! sendLockTask = attempt <| fun () ->
                 sendLock.WaitAsync cancelToken
 
-            do! awaitUnitTask sendLockTask
-
-            let! hasReceiveLock = attempt <| fun () ->
-                receiveLock.Wait 0
+            let hasReceiveLock = ref false
 
             let closeOp =
                 fio {
+                    do! awaitUnitTask sendLockTask
+
+                    let! takenReceiveLock = attempt <| fun () -> receiveLock.Wait 0
+                    hasReceiveLock.Value <- takenReceiveLock
+
                     let! closeTask = attempt <| fun () ->
-                        if hasReceiveLock then
+                        if takenReceiveLock then
                             socket.CloseAsync(closeStatus, statusDescription, cancelToken)
                         else
                             socket.CloseOutputAsync(closeStatus, statusDescription, cancelToken)
@@ -306,10 +320,10 @@ type WebSocket internal (socket: Net.WebSockets.WebSocket, config: WebSocketConf
 
             let finalizer =
                 fio {
-                    do! attempt(fun () -> sendLock.Release() |> ignore)
+                    do! attempt(fun () -> releasePermitWhenGranted sendLock sendLockTask)
                             .CatchAll(logAndSuppress "sendLock release")
 
-                    if hasReceiveLock then
+                    if hasReceiveLock.Value then
                         do! attempt(fun () -> receiveLock.Release() |> ignore)
                                 .CatchAll(logAndSuppress "receiveLock release")
                 }
@@ -341,17 +355,17 @@ type WebSocket internal (socket: Net.WebSockets.WebSocket, config: WebSocketConf
             let! sendLockTask = attempt <| fun () ->
                 sendLock.WaitAsync cancelToken
 
-            do! awaitUnitTask sendLockTask
-
             let closeOp =
                 fio {
+                    do! awaitUnitTask sendLockTask
+
                     let! closeTask = attempt <| fun () ->
                         socket.CloseOutputAsync(closeStatus, statusDescription, cancelToken)
                     do! awaitUnitTask closeTask
                 }
 
             let finalizer =
-                attempt(fun () -> sendLock.Release() |> ignore)
+                attempt(fun () -> releasePermitWhenGranted sendLock sendLockTask)
                     .CatchAll(logAndSuppress "sendLock release")
 
             return! closeOp.Ensuring finalizer
@@ -374,25 +388,25 @@ type WebSocket internal (socket: Net.WebSockets.WebSocket, config: WebSocketConf
             do! attempt <| fun () -> socket.Abort()
         }
 
-    /// Gets the current connection state.
+    /// Returns an effect that yields this connection's current state.
     member _.State () =
         fio {
             return! attempt <| fun () -> socket.State
         }
 
-    /// Gets the close status, if the connection has closed.
+    /// Returns an effect that yields this connection's close status, if it has closed.
     member _.CloseStatus () =
         fio {
             return! attempt <| fun () -> Option.ofNullable socket.CloseStatus
         }
 
-    /// Gets the close status description, if any.
+    /// Returns an effect that yields this connection's close status description, if any.
     member _.CloseStatusDescription () =
         fio {
             return! attempt <| fun () -> socket.CloseStatusDescription
         }
 
-    /// Gets the negotiated subprotocol, if any.
+    /// Returns an effect that yields the negotiated subprotocol, if any.
     member _.Subprotocol () =
         fio {
             return! attempt <| fun () -> socket.SubProtocol

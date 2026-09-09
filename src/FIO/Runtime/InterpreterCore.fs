@@ -2,6 +2,7 @@ module internal FIO.Runtime.InterpreterCore
 
 open FIO.DSL
 
+open System
 open System.Threading
 open System.Threading.Tasks
 open System.Collections.Generic
@@ -28,7 +29,7 @@ type InterpreterState =
 type RuntimeCase =
     | HandleWriteChan of message: obj * channel: Channel<obj>
     | HandleReadChan of channel: Channel<obj>
-    | HandleForkEffect of effect: FIO<obj, obj> * fiber: obj * fiberContext: FiberContext
+    | HandleForkEffect of effect: FIO<obj, obj> * fiber: obj * fiberContext: FiberContext * daemon: bool
     | HandleJoinFiber of fiberContext: FiberContext
     | HandleJoinFirst of fiberContexts: FiberContext list
     | HandleJoinAllFailFast of allFiberContexts: FiberContext[]
@@ -76,14 +77,14 @@ let inline processOutcome
                 try
                     state.Effect <- cont value
                 with ex ->
-                    state.Effect <- Failure(ex :> obj)
+                    state.Effect <- Interrupt(Defect ex, ex.Message)
 
                 loop <- false
             | OutcomeFailed error, FailureCont cont ->
                 try
                     state.Effect <- cont error
                 with ex ->
-                    state.Effect <- Failure(ex :> obj)
+                    state.Effect <- Interrupt(Defect ex, ex.Message)
 
                 loop <- false
             | OutcomeSucceeded _, FailureCont _
@@ -105,7 +106,12 @@ let inline processOutcome
                 state.ContStack.Push(PostFinalizerCont(PostFinalizerInterrupted error))
                 state.Effect <- finalizer
                 loop <- false
-            | OutcomeInterrupted _, PostFinalizerCont _ -> ()
+            | OutcomeInterrupted _, PostFinalizerCont saved ->
+                state.InterruptionSuppressed <- state.InterruptionSuppressed - 1
+                match saved with
+                | PostFinalizerSucceeded _
+                | PostFinalizerFailed _ -> ()
+                | PostFinalizerInterrupted savedErr -> outcome <- OutcomeInterrupted savedErr
             | OutcomeSucceeded _, PostFinalizerCont saved ->
                 state.InterruptionSuppressed <- state.InterruptionSuppressed - 1
                 outcome <-
@@ -129,7 +135,11 @@ let inline processResult
     | Ok value ->
         processOutcome &state onSuccessComplete onErrorComplete (OutcomeSucceeded value)
     | Error error ->
-        processOutcome &state onSuccessComplete onErrorComplete (OutcomeFailed error)
+        match error with
+        | :? FiberInterruptedException ->
+            processOutcome &state onSuccessComplete onErrorComplete (OutcomeInterrupted error)
+        | _ ->
+            processOutcome &state onSuccessComplete onErrorComplete (OutcomeFailed error)
 
 let inline handleSharedCase
     (state: byref<InterpreterState>)
@@ -152,23 +162,39 @@ let inline handleSharedCase
             (OutcomeInterrupted(FiberInterruptedException(state.FiberContext.Id, cause, message) :> obj))
         ValueNone
     | FiberCancellationToken ->
-        processOutcome
-            &state
-            onSuccessComplete
-            onErrorComplete
-            (OutcomeSucceeded(state.FiberContext.CancellationToken :> obj))
+        let token =
+            if state.InterruptionSuppressed > 0 then
+                CancellationToken.None
+            else
+                state.FiberContext.CancellationToken
+
+        processOutcome &state onSuccessComplete onErrorComplete (OutcomeSucceeded(token :> obj))
         ValueNone
     | Action(func, onError) ->
+        let mutable thrown: exn = null
+        let mutable value = Unchecked.defaultof<obj>
+
         try
-            let value = func ()
-            processOutcome &state onSuccessComplete onErrorComplete (OutcomeSucceeded value)
+            value <- func ()
         with ex ->
-            let error =
-                try
-                    onError ex
-                with _ ->
-                    ex :> obj
-            processOutcome &state onSuccessComplete onErrorComplete (OutcomeFailed error)
+            thrown <- ex
+
+        if isNull thrown then
+            processOutcome &state onSuccessComplete onErrorComplete (OutcomeSucceeded value)
+        else
+            let mutable mapped = false
+            let mutable error = Unchecked.defaultof<obj>
+
+            try
+                error <- onError thrown
+                mapped <- true
+            with _ ->
+                ()
+
+            if mapped then
+                processOutcome &state onSuccessComplete onErrorComplete (OutcomeFailed error)
+            else
+                state.Effect <- Interrupt(Defect thrown, thrown.Message)
         ValueNone
     | ChainSuccess(effect, cont) ->
         state.Effect <- effect
@@ -188,14 +214,17 @@ let inline handleSharedCase
         state.Effect <- effect
         ValueNone
     | Suspend effect ->
-        state.Effect <- effect ()
+        try
+           state.Effect <- effect ()
+        with ex ->
+           state.Effect <- Interrupt(Defect ex, ex.Message)
         ValueNone
     | WriteChan(value, channel) ->
         ValueSome(HandleWriteChan(value, channel))
     | ReadChan channel ->
         ValueSome(HandleReadChan channel)
-    | ForkEffect(effect, fiber, fiberContext) ->
-        ValueSome(HandleForkEffect(effect, fiber, fiberContext))
+    | ForkEffect(effect, fiber, fiberContext, daemon) ->
+        ValueSome(HandleForkEffect(effect, fiber, fiberContext, daemon))
     | JoinFiber fiberContext ->
         ValueSome(HandleJoinFiber fiberContext)
     | JoinFirst fiberContexts ->
@@ -211,6 +240,75 @@ let inline setupForkRegistration (parentContext: FiberContext) (childContext: Fi
             childContext.Interrupt(ParentInterrupted parentContext.Id, "Parent fiber was interrupted."))
     childContext.AddRegistration registration
     registration
+
+let inline attachFork (parentContext: FiberContext) (childContext: FiberContext) (daemon: bool) =
+    if not daemon then
+        let registration =
+            parentContext.ChildScopeToken.Register(fun () ->
+                childContext.Interrupt(ParentInterrupted parentContext.Id, "Parent fiber scope closed."))
+        childContext.AddRegistration registration
+        childContext.AttachTo parentContext
+
+let inline defectError (fiberContext: FiberContext) (ex: exn) : obj =
+    FiberInterruptedException(fiberContext.Id, Defect ex, ex.Message) :> obj
+
+let inline awaitTaskFailureOutcome (fiberContext: FiberContext) (onError: exn -> obj) (ex: exn) =
+    try
+        OutcomeFailed(onError ex)
+    with _ ->
+        OutcomeInterrupted(defectError fiberContext ex)
+
+let inline resumeWith (state: byref<InterpreterState>) (workItem: WorkItem) =
+    workItem.InterruptionSuppressed <- state.InterruptionSuppressed
+    workItem
+
+let inline awaitedTask (awaited: Task<'T>) (suppressed: int) (fiberContext: FiberContext) : Task<'T> =
+    if suppressed > 0 then
+        awaited
+    else
+        awaited.WaitAsync fiberContext.CancellationToken
+
+let settledTaskEffect (waited: Task<obj>) (fiberContext: FiberContext) (onError: exn -> obj) : FIO<obj, obj> =
+    if waited.IsCompletedSuccessfully then
+        Success waited.Result
+    elif waited.IsCanceled && fiberContext.CancellationToken.IsCancellationRequested then
+        Interrupt(ExplicitInterrupt, "Task has been cancelled.")
+    else
+        let ex =
+            match waited.Exception with
+            | null -> OperationCanceledException() :> exn
+            | aggregate ->
+                match aggregate.InnerException with
+                | null -> aggregate :> exn
+                | inner -> inner
+
+        try
+            Failure(onError ex)
+        with _ ->
+            Interrupt(Defect ex, ex.Message)
+
+let inline parkOnTask
+    (waited: Task<obj>)
+    (fiberContext: FiberContext)
+    (contStack: Stack<Cont>)
+    (suppressed: int)
+    (onError: exn -> obj)
+    ([<InlineIfLambda>] reschedule: WorkItem -> unit) =
+    let resume () =
+        let resumeWorkItem =
+            {
+                Effect = settledTaskEffect waited fiberContext onError
+                FiberContext = fiberContext
+                ContStack = contStack
+                InterruptionSuppressed = suppressed
+            }
+
+        try
+            reschedule resumeWorkItem
+        with _ ->
+            ()
+
+    waited.GetAwaiter().OnCompleted(Action resume)
 
 let parkBlockingWaiter
     (fiberContext: FiberContext)

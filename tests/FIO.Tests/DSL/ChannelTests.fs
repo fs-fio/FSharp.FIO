@@ -1,10 +1,10 @@
 module FIO.Tests.ChannelTests
 
+open FIO.Tests.Utilities
 open FIO.Tests.Utilities.FsCheckProperties
 
 open FIO.DSL
 open FIO.Runtime
-open FIO.Runtime.Direct
 open FIO.Runtime.Polling
 open FIO.Runtime.Signaling
 open FIO.Runtime.WorkStealing
@@ -13,16 +13,6 @@ open Expecto
 
 open System
 open System.Collections.Generic
-
-let private runtimes () =
-    [
-        new DirectRuntime() :> FIORuntime
-        new PollingRuntime() :> FIORuntime
-        new WorkStealingRuntime() :> FIORuntime
-    ]
-
-let private testAllRuntimes name (f: FIORuntime -> unit) =
-    testList name [ for rt in runtimes () -> testCase (rt.GetType().Name) (fun () -> f rt) ]
 
 [<Tests>]
 let channelTests =
@@ -609,9 +599,10 @@ let channelTests =
             // Regression test for the SignalingRuntime lost-wakeup: a StoreLoad (Dekker) race in the
             // signal-coalescing mutual check, where a writer (publish message, then test "is a reader
             // parked?") and a parking reader (publish park, then test "is a message present?") could
-            // each read the other's pre-publish value and both decline to signal. Fixed by the memory
-            // fences in signalBlockingWorkerIfPending / processBlockingChannel. The race is
-            // intermittent, so the bounded-buffer pattern is looped to reliably surface a regression.
+            // each read the other's pre-publish value and both decline to signal. The runtime now parks
+            // blocked readers on the channel's own MailboxQueue.WaitToReadAsync instead of hand-rolled
+            // signalling, which removes the race. The race was intermittent, so the bounded-buffer
+            // pattern is looped to reliably surface a regression.
             stressTestCase "Stress - bounded-buffer pattern at high iteration count (Signaling lost-wakeup regression)"
             <| fun () ->
                 let producerCount = 4

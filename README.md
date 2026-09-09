@@ -8,7 +8,6 @@
   <p>
     <a href="https://www.nuget.org/packages/FSharp.FIO"><img src="https://img.shields.io/nuget/v/FSharp.FIO.svg?logo=nuget&label=nuget" alt="NuGet"></a>
     <a href="https://github.com/fs-fio/fio/actions/workflows/test.yml"><img src="https://github.com/fs-fio/fio/actions/workflows/test.yml/badge.svg" alt="Run Tests"></a>
-    <a href="https://codecov.io/gh/fs-fio/fio"><img src="https://codecov.io/gh/fs-fio/fio/branch/main/graph/badge.svg" alt="Coverage"></a>
     <a href="https://github.com/fs-fio/fio/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
     <img src="https://img.shields.io/badge/.NET-10-512BD4.svg?logo=dotnet" alt=".NET 10">
   </p>
@@ -88,12 +87,20 @@ Effects are interpreted by a runtime. Pick one explicitly, or use `DefaultRuntim
 
 | Runtime | Notes |
 |---------|-------|
-| `DirectRuntime` | Single-threaded, synchronous. Handy for tests and simple programs. |
+| `DirectRuntime` | Multi-threaded via the .NET thread pool — one task per fiber, no scheduler of its own. Handy for tests and as a baseline. |
 | `PollingRuntime` | Multi-threaded, linear-time handling of blocked fibers (polling). |
 | `SignalingRuntime` | Multi-threaded, event-driven handling of blocked fibers. |
 | `WorkStealingRuntime` | Multi-threaded, work-stealing scheduler. **The default.** |
 
 `DefaultRuntime = WorkStealingRuntime` — `FIOApp` uses it unless you `override _.runtime`.
+
+## Benchmarks
+
+Twelve concurrency workloads (Pingpong, Threadring, Chameneos, Philosophers, …) run against every
+runtime, reporting execution time and allocations. Pingpong is tracked per commit on the
+[**live benchmark dashboard**](https://fs-fio.github.io/fio/dev/bench/); the full suite,
+its parameters, and the A/B comparison protocol are documented in
+[`benchmarks/FIO.Benchmarks/README.md`](https://github.com/fs-fio/fio/blob/main/benchmarks/FIO.Benchmarks/README.md).
 
 ## Packages
 

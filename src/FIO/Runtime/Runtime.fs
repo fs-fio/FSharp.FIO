@@ -174,7 +174,9 @@ type FIORuntime internal () =
     default this.ConfigString =
         this.Name
 
-    /// Runs the given effect, returning a fiber for its eventual result.
+    /// Schedules the given effect on a new fiber and returns immediately with a handle to it. Safe to
+    /// call concurrently and as often as you like — for example once per request in a server — because
+    /// it never waits for, interrupts, or discards any fiber already running on this runtime.
     abstract member Run<'A, 'E> : FIO<'A, 'E> -> Fiber<'A, 'E>
 
     /// Returns a filesystem-safe form of this runtime's configuration string.

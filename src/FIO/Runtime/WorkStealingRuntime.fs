@@ -137,14 +137,6 @@ type internal Scheduler(workerCount: int) =
             ()
         }
 
-    member _.Reset () =
-        globalQueue.Clear()
-        for i in 0 .. workerCount - 1 do
-            Interlocked.Exchange(&runNext.[i], Unchecked.defaultof<_>) |> ignore
-            let mutable drained = Unchecked.defaultof<WorkItem>
-            while deques.[i].TryPopBottom &drained do
-                ()
-
     member _.Dispose () =
         workGate.Dispose()
 
@@ -245,15 +237,21 @@ and private Worker(config: EvaluationWorkerConfig) =
                     // Completed (success/failure) fibers have nothing left to run, but an interrupted
                     // fiber may still need to unwind finalizers, so it must not be gated out here.
                     if hasWork && not (workItem.FiberContext.IsCompleted()) then
+                        let fiberContext = workItem.FiberContext
                         try
                             do! runtime.InterpretAsync workItem config.EvaluationSteps workerId
                         with ex ->
                             try
-                                do! workItem.FiberContext.CompleteAndReschedule(Error(ex :> obj), scheduler.GlobalQueue)
+                                do!
+                                    fiberContext.CompleteAndReschedule(
+                                        Error(defectError fiberContext ex),
+                                        scheduler.GlobalQueue)
                                 scheduler.SignalWork()
                             with _ ->
                                 ()
-                            raise ex
+
+                            Console.Error.WriteLine
+                                $"FIO Worker '{workerId}' recovered from an unhandled effect exception: {ex}"
             }
 
     interface IDisposable with
@@ -269,9 +267,7 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
     let workerCount = config.EvaluationWorkers
     let scheduler = Scheduler(workerCount)
 
-    let mutable currentFiber: FiberContext option = None
 
-    let runLock = obj ()
 
     let workers =
         List.init workerCount (fun i ->
@@ -332,8 +328,8 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                 (OutcomeInterrupted error)
                     elif currentEvaluationSteps = 0 then
                         if scheduler.HasOtherWork workerId then
-                            let newWorkItem = scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack)
-                            newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                            let newWorkItem =
+                                resumeWith &state (scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack))
                             scheduler.ScheduleLocal(workerId, newWorkItem)
                             state.Completed <- true
                         else
@@ -377,8 +373,7 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                         (OutcomeSucceeded value)
                                 else
                                     let newWorkItem =
-                                        scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack))
                                     let waiter =
                                         parkBlockingWaiter currentFiberContext state.InterruptionSuppressed newWorkItem (fun wi ->
                                             scheduler.GlobalQueue.WriteAsync wi |> ignore
@@ -393,8 +388,8 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                         if channel.TryDequeueBlockingWorkItem &blockedReader then
                                             scheduler.ScheduleLocal(workerId, blockedReader)
                                     state.Completed <- true
-                            | HandleForkEffect(effect, fiber, fiberContext) ->
-                                let _ = setupForkRegistration currentFiberContext fiberContext
+                            | HandleForkEffect(effect, fiber, fiberContext, daemon) ->
+                                attachFork currentFiberContext fiberContext daemon
                                 let forkedWorkItem = scheduler.RentWorkItem(workerId, effect, fiberContext, scheduler.RentContStack workerId)
                                 scheduler.ScheduleLocal(workerId, forkedWorkItem)
                                 processOutcome
@@ -412,8 +407,7 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                         value
                                 else
                                     let newWorkItem =
-                                        scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack))
                                     let waiter =
                                         parkBlockingWaiter currentFiberContext state.InterruptionSuppressed newWorkItem (fun wi ->
                                             scheduler.GlobalQueue.WriteAsync wi |> ignore
@@ -433,8 +427,7 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                         (OutcomeSucceeded(box index))
                                 | _ ->
                                     let newWorkItem =
-                                        scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack))
                                     let waiter =
                                         parkBlockingWaiter currentFiberContext state.InterruptionSuppressed newWorkItem (fun wi ->
                                             scheduler.GlobalQueue.WriteAsync wi |> ignore
@@ -458,8 +451,7 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                         (OutcomeSucceeded(box outcome))
                                 | ValueNone ->
                                     let newWorkItem =
-                                        scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (scheduler.RentWorkItem(workerId, state.Effect, currentFiberContext, state.ContStack))
                                     let waiter =
                                         parkBlockingWaiter currentFiberContext state.InterruptionSuppressed newWorkItem (fun wi ->
                                             scheduler.GlobalQueue.WriteAsync wi |> ignore
@@ -471,11 +463,7 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                             scheduler.SignalWork())
                                     state.Completed <- true
                             | HandleAwaitTask(awaited, onError) ->
-                                let waited =
-                                    if state.InterruptionSuppressed > 0 then
-                                        awaited
-                                    else
-                                        awaited.WaitAsync currentFiberContext.CancellationToken
+                                let waited = awaitedTask awaited state.InterruptionSuppressed currentFiberContext
 
                                 if waited.IsCompletedSuccessfully then
                                     processOutcome
@@ -484,45 +472,16 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                         onErrorComplete
                                         (OutcomeSucceeded waited.Result)
                                 else
-                                    let fiberContext = currentFiberContext
-                                    let suppressed = state.InterruptionSuppressed
-                                    let contStack = state.ContStack
+                                    parkOnTask
+                                        waited
+                                        currentFiberContext
+                                        state.ContStack
+                                        state.InterruptionSuppressed
+                                        onError
+                                        (fun workItem ->
+                                            scheduler.GlobalQueue.WriteAsync workItem |> ignore
+                                            scheduler.SignalWork())
 
-                                    let resume () =
-                                        let resumeEffect =
-                                            if waited.IsCompletedSuccessfully then
-                                                Success waited.Result
-                                            elif waited.IsCanceled
-                                                 && fiberContext.CancellationToken.IsCancellationRequested then
-                                                Interrupt(ExplicitInterrupt, "Task has been cancelled.")
-                                            else
-                                                let ex =
-                                                    match waited.Exception with
-                                                    | null -> OperationCanceledException() :> exn
-                                                    | aggregate ->
-                                                        match aggregate.InnerException with
-                                                        | null -> aggregate :> exn
-                                                        | inner -> inner
-                                                let error =
-                                                    try onError ex
-                                                    with _ -> ex :> obj
-                                                Failure error
-
-                                        let resumeWorkItem =
-                                            {
-                                                Effect = resumeEffect
-                                                FiberContext = fiberContext
-                                                ContStack = contStack
-                                                InterruptionSuppressed = suppressed
-                                            }
-
-                                        try
-                                            scheduler.GlobalQueue.WriteAsync resumeWorkItem |> ignore
-                                            scheduler.SignalWork()
-                                        with _ ->
-                                            ()
-
-                                    waited.GetAwaiter().OnCompleted(Action resume)
                                     state.Completed <- true
 
                 match completionAction with
@@ -542,28 +501,16 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                 scheduler.ReturnWorkItem(workerId, workItem)
         }
 
-    member private _.Reset () =
-        scheduler.Reset()
-
+    /// Schedules the given effect on a new fiber and returns immediately with a handle to it. Safe to
+    /// call concurrently and as often as you like: it never waits for, interrupts, or discards any
+    /// fiber already running on this runtime.
     override _.Run<'A, 'E> (effect: FIO<'A, 'E>) : Fiber<'A, 'E> =
-        lock runLock (fun () ->
-            match currentFiber with
-            | Some fiberContext when not (fiberContext.IsTerminal()) ->
-                fiberContext.Task.GetAwaiter().GetResult() |> ignore
-            | _ -> ()
+        let fiber = new Fiber<'A, 'E>()
 
-            match currentFiber with
-            | Some fiberContext -> fiberContext.Cancel()
-            | None -> ()
+        let workItem =
+            WorkItemPool.Rent(effect.UpcastBoth(), fiber.Context, ContStackPool.Rent())
 
-            this.Reset()
-            let fiber = new Fiber<'A, 'E>()
-            currentFiber <- Some fiber.Context
+        scheduler.GlobalQueue.WriteAsync workItem |> ignore
+        scheduler.SignalWork()
 
-            let workItem =
-                WorkItemPool.Rent(effect.UpcastBoth(), fiber.Context, ContStackPool.Rent())
-
-            scheduler.GlobalQueue.WriteAsync workItem |> ignore
-            scheduler.SignalWork()
-
-            fiber)
+        fiber

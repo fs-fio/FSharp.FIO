@@ -1,39 +1,15 @@
 module FIO.Tests.FIOTests
 
+open FIO.Tests.Utilities
 open FIO.Tests.Utilities.FsCheckProperties
 
 open FIO.DSL
 open FIO.Runtime
-open FIO.Runtime.Direct
-open FIO.Runtime.Polling
-open FIO.Runtime.Signaling
-open FIO.Runtime.WorkStealing
 
 open Expecto
 
 open System
 open System.Threading
-
-let private runtimes () =
-    [
-        new DirectRuntime() :> FIORuntime
-        new PollingRuntime() :> FIORuntime
-        new WorkStealingRuntime() :> FIORuntime
-    ]
-
-let private testAllRuntimes name (f: FIORuntime -> unit) =
-    testList name [ for rt in runtimes () -> testCase (rt.GetType().Name) (fun () -> f rt) ]
-
-let private allFourRuntimes () =
-    [
-        new DirectRuntime() :> FIORuntime
-        new PollingRuntime() :> FIORuntime
-        new SignalingRuntime() :> FIORuntime
-        new WorkStealingRuntime() :> FIORuntime
-    ]
-
-let private testAllFourRuntimes name (f: FIORuntime -> unit) =
-    testList name [ for rt in allFourRuntimes () -> testCase (rt.GetType().Name) (fun () -> f rt) ]
 
 [<Tests>]
 let fioTests =
@@ -61,6 +37,7 @@ let fioTests =
                 let effect =
                     fio {
                         let! fiber = FIO.fail(error).Fork()
+                        let! _ = fiber.Await()
                         return fiber
                     }
 
@@ -209,22 +186,22 @@ let fioTests =
             // ─── Ensuring ─────────────────────────────────────────
 
             testAllRuntimes "Ensuring - runs finalizer on success" (fun runtime ->
-                let mutable finalizerRan = false
-                let finalizer = FIO.attempt (fun () -> finalizerRan <- true) (fun _ -> "")
+                let mutable waitForFlag = false
+                let finalizer = FIO.attempt (fun () -> waitForFlag <- true) (fun _ -> "")
                 let effect = FIO.succeed(42).Ensuring finalizer
 
                 runtime.Run(effect).UnsafeSuccess() |> ignore
 
-                Expect.isTrue finalizerRan "Finalizer should run on success")
+                Expect.isTrue waitForFlag "Finalizer should run on success")
 
             testAllRuntimes "Ensuring - runs finalizer on error" (fun runtime ->
-                let mutable finalizerRan = false
-                let finalizer = FIO.attempt (fun () -> finalizerRan <- true) (fun _ -> "")
+                let mutable waitForFlag = false
+                let finalizer = FIO.attempt (fun () -> waitForFlag <- true) (fun _ -> "")
                 let effect = FIO.fail("boom").Ensuring finalizer
 
                 runtime.Run(effect).UnsafeError() |> ignore
 
-                Expect.isTrue finalizerRan "Finalizer should run on error")
+                Expect.isTrue waitForFlag "Finalizer should run on error")
 
             testPropertyWithConfig fsCheckConfig "Ensuring - preserves success result"
             <| fun (runtime: FIORuntime, value: int) ->
@@ -265,13 +242,13 @@ let fioTests =
                             (FIO.interruptNow ())
                                 .Ensuring(FIO.attempt (fun () -> flag.Value <- true) id)
                                 .Fork()
-                        do! fiber.Join().CatchAll(fun _ -> FIO.unit ())
+                        do! (fiber.Await()).Unit()
                         do! FIO.sleep (TimeSpan.FromMilliseconds 50.0) id
                     }
 
                 runtime.Run(effect).UnsafeSuccess() |> ignore
 
-                Expect.isTrue flag.Value "Finalizer should run on self-interruption"
+                Expect.isTrue (waitForFlag flag) "Finalizer should run on self-interruption"
 
             testAllRuntimes "Ensuring - finalizer runs on external interruption"
             <| fun (runtime: FIORuntime) ->
@@ -286,13 +263,13 @@ let fioTests =
 
                         do! FIO.sleep (TimeSpan.FromMilliseconds 50.0) id
                         do! fiber.InterruptNow ()
-                        do! fiber.Join().CatchAll(fun _ -> FIO.unit ())
+                        do! (fiber.Await()).Unit()
                         do! FIO.sleep (TimeSpan.FromMilliseconds 50.0) id
                     }
 
                 runtime.Run(effect).UnsafeSuccess() |> ignore
 
-                Expect.isTrue flag.Value "Finalizer should run on external interruption"
+                Expect.isTrue (waitForFlag flag) "Finalizer should run on external interruption"
 
             testAllRuntimes "Ensuring - nested finalizers both run on interrupt"
             <| fun (runtime: FIORuntime) ->
@@ -309,16 +286,16 @@ let fioTests =
 
                         do! FIO.sleep (TimeSpan.FromMilliseconds 50.0) id
                         do! fiber.InterruptNow ()
-                        do! fiber.Join().CatchAll(fun _ -> FIO.unit ())
+                        do! (fiber.Await()).Unit()
                         do! FIO.sleep (TimeSpan.FromMilliseconds 50.0) id
                     }
 
                 runtime.Run(effect).UnsafeSuccess() |> ignore
 
-                Expect.isTrue flag1.Value "Inner finalizer should run on interrupt"
-                Expect.isTrue flag2.Value "Outer finalizer should run on interrupt"
+                Expect.isTrue (waitForFlag flag1) "Inner finalizer should run on interrupt"
+                Expect.isTrue (waitForFlag flag2) "Outer finalizer should run on interrupt"
 
-            testAllFourRuntimes "Ensuring - finalizer runs on interruption while blocked on channel read"
+            testAllRuntimes "Ensuring - finalizer runs on interruption while blocked on channel read"
             <| fun (runtime: FIORuntime) ->
                 let flag = ref false
                 let channel = Channel<int>()
@@ -334,15 +311,15 @@ let fioTests =
 
                         do! FIO.sleep (TimeSpan.FromMilliseconds 50.0) id
                         do! fiber.InterruptNow ()
-                        do! fiber.Join().CatchAll(fun _ -> FIO.unit ())
+                        do! (fiber.Await()).Unit()
                         do! FIO.sleep (TimeSpan.FromMilliseconds 50.0) id
                     }
 
                 runtime.Run(effect).UnsafeSuccess() |> ignore
 
-                Expect.isTrue flag.Value "Finalizer should run when interrupted while blocked on a channel read"
+                Expect.isTrue (waitForFlag flag) "Finalizer should run when interrupted while blocked on a channel read"
 
-            testAllFourRuntimes "Ensuring - finalizer runs on interruption while blocked on fiber join"
+            testAllRuntimes "Ensuring - finalizer runs on interruption while blocked on fiber join"
             <| fun (runtime: FIORuntime) ->
                 let flag = ref false
 
@@ -358,13 +335,13 @@ let fioTests =
 
                         do! FIO.sleep (TimeSpan.FromMilliseconds 50.0) id
                         do! joiner.InterruptNow ()
-                        do! joiner.Join().CatchAll(fun _ -> FIO.unit ())
+                        do! (joiner.Await()).Unit()
                         do! FIO.sleep (TimeSpan.FromMilliseconds 50.0) id
                     }
 
                 runtime.Run(effect).UnsafeSuccess() |> ignore
 
-                Expect.isTrue flag.Value "Finalizer should run when interrupted while blocked on a fiber join"
+                Expect.isTrue (waitForFlag flag) "Finalizer should run when interrupted while blocked on a fiber join"
 
             testAllRuntimes "Ensuring - result is still interrupted when finalizer fails"
             <| fun (runtime: FIORuntime) ->
@@ -495,63 +472,72 @@ let fioTests =
 
             // ─── Throw-in-handler (E-1 / E-2) ─────────────────────────────────────────
 
-            testAllRuntimes "Action - throwing onError falls back to original exception (E-1)" (fun runtime ->
+            testAllRuntimes "Action - throwing onError surfaces the original exception as a defect (E-1)" (fun runtime ->
                 let originalExn = InvalidOperationException "original"
 
-                let effect =
+                let effect: FIO<int, exn> =
                     FIO.attempt
                         (fun () -> raise originalExn)
                         (fun _ -> failwith "onError also throws")
 
-                let result =
-                    runtime.Run(effect).UnsafeError()
+                match runtime.Run(effect).UnsafeResult() with
+                | Interrupted ex ->
+                    match ex.cause with
+                    | Defect defect ->
+                        Expect.isTrue
+                            (obj.ReferenceEquals(defect, originalExn))
+                            "When onError throws, the original exception should surface as the defect"
+                    | other -> failtest $"Expected a Defect cause but got {other}"
+                | other -> failtest $"Expected Interrupted but got {other}")
 
-                Expect.isTrue
-                    (obj.ReferenceEquals(result, originalExn))
-                    "When onError throws, the original exception should be used as the error")
-
-            testAllRuntimes "FlatMap - throwing continuation produces error (E-2)" (fun runtime ->
+            testAllRuntimes "FlatMap - throwing continuation produces a defect (E-2)" (fun runtime ->
                 let effect: FIO<int, exn> =
                     FIO.succeed(42)
                         .FlatMap(fun (_: int) -> failwith "continuation throws")
 
-                let result =
-                    runtime.Run(effect).UnsafeError()
+                match runtime.Run(effect).UnsafeResult() with
+                | Interrupted ex ->
+                    match ex.cause with
+                    | Defect defect ->
+                        Expect.equal defect.Message "continuation throws" "Thrown exception should become the defect"
+                    | other -> failtest $"Expected a Defect cause but got {other}"
+                | other -> failtest $"Expected Interrupted but got {other}")
 
-                Expect.equal result.Message "continuation throws" "Thrown exception should become the error")
-
-            testAllRuntimes "CatchAll - throwing error handler produces error (E-2)" (fun runtime ->
+            testAllRuntimes "CatchAll - throwing error handler produces a defect (E-2)" (fun runtime ->
                 let effect: FIO<int, exn> =
                     FIO.fail(InvalidOperationException "typed error")
                         .CatchAll(fun _ -> failwith "handler throws")
 
-                let result =
-                    runtime.Run(effect).UnsafeError()
-
-                Expect.equal
-                    result.Message
-                    "handler throws"
-                    "Thrown exception in CatchAll handler should become the error")
+                match runtime.Run(effect).UnsafeResult() with
+                | Interrupted ex ->
+                    match ex.cause with
+                    | Defect defect ->
+                        Expect.equal
+                            defect.Message
+                            "handler throws"
+                            "Thrown exception in CatchAll handler should become the defect"
+                    | other -> failtest $"Expected a Defect cause but got {other}"
+                | other -> failtest $"Expected Interrupted but got {other}")
 
             // ─── Run lifecycle ─────────────────────────────────────────
 
-            testAllRuntimes "Run - orphaned child fibers are interrupted on re-Run" (fun runtime ->
+            // Run schedules and nothing more. It used to interrupt the previous root fiber's tree,
+            // which is incompatible with calling Run per request; cleaning up a fiber you started is
+            // now the caller's job, done through the handle they already hold. Interrupting unwinds the
+            // fiber properly, which the old queue-clearing reset did not.
+            testAllRuntimes "Run - a later Run leaves an existing fiber alone; the caller interrupts it" (fun runtime ->
                 let childStarted = new ManualResetEventSlim false
 
                 let childEffect: FIO<unit, exn> =
                     fio {
-                        do! FIO.attempt
-                                (fun () -> childStarted.Set())
-                                id
+                        do! FIO.attempt (fun () -> childStarted.Set()) id
                         return! FIO.never ()
                     }
 
                 let parentEffect: FIO<obj, exn> =
                     fio {
-                        let! fiber = childEffect.Fork()
-                        do! FIO.attempt
-                                (fun () -> childStarted.Wait(TimeSpan.FromSeconds 5.0) |> ignore)
-                                id
+                        let! fiber = childEffect.ForkDaemon()
+                        do! FIO.attempt (fun () -> childStarted.Wait(TimeSpan.FromSeconds 5.0) |> ignore) id
                         return fiber :> obj
                     }
 
@@ -561,11 +547,17 @@ let fioTests =
                 let fiber2 = runtime.Run(FIO.succeed 99)
                 Expect.equal (fiber2.UnsafeSuccess()) 99 "Second run should succeed"
 
-                let childResult = childFiber.UnsafeResult()
+                Expect.isFalse
+                    (childFiber.IsTerminal())
+                    "A later Run must leave a fiber that is already running untouched"
 
-                match childResult with
+                runtime.Run(childFiber.InterruptNow()).UnsafeSuccess()
+
+                match childFiber.UnsafeResult() with
                 | Interrupted _ -> ()
-                | other -> failtestf "Expected child fiber to be Interrupted, got %A" other)
+                | other -> failtestf "Expected the child fiber to be Interrupted once asked, got %A" other
+
+                childStarted.Dispose())
 
             testAllRuntimes "Run - second Run produces correct result after first completes" (fun runtime ->
                 let fiber1 = runtime.Run(FIO.succeed 1)

@@ -107,20 +107,30 @@ module WebSocketServer =
 
     /// Continuously accepts connections, forking the handler for each.
     let acceptLoop (listener: HttpListener) (config: WebSocketConfig) (handler: WebSocket -> FIO<unit, WsError>) =
+        let disposeConnection (ws: WebSocket) =
+            (FIO.attempt (fun () -> (ws :> IDisposable).Dispose()) WsError.fromException)
+                .CatchAll(logAndSuppress "websocket disposal")
+
         let handleConnection (ws: WebSocket) =
             (handler ws)
                 .CatchAll(logAndSuppress "connection handler")
                 .Ensuring(ws.Close().CatchAll(fun _ -> FIO.unit ()))
+                .Ensuring(disposeConnection ws)
 
         let step =
-            fio {
+            (fio {
                 match! tryAccept listener config None with
                 | Some ws ->
                     let! _ = (handleConnection ws).Fork()
                     return ()
                 | None ->
                     return ()
-            }
+            })
+                .CatchAll(fun error ->
+                    fio {
+                        do! logAndSuppress "accept loop iteration" error
+                        do! FIO.sleep (TimeSpan.FromMilliseconds 25.0) WsError.fromException
+                    })
 
         step.Forever()
 

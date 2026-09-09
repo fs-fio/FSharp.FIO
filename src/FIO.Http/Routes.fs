@@ -17,6 +17,7 @@ type Routes<'E> =
         {
             RouteList: Route<'E> list
             NotFoundHandler: HttpHandler<'E>
+            MethodNotAllowedHandler: string list -> HttpHandler<'E>
             ExactMatchIndex: Map<HttpMethod * string, obj list -> HttpHandler<'E>>
             ParameterizedRoutes: Route<'E> list
         }
@@ -33,6 +34,9 @@ module Routes =
         match pattern.Path with
         | Exact segments -> Some("/" + String.concat "/" segments)
         | _ -> None
+
+    let private defaultMethodNotAllowed (methods: string list) : HttpHandler<'E> =
+        HttpHandler.succeed (Response.methodNotAllowed methods)
 
     let private buildIndex (routes: Route<'E> list) =
         let exactMatches, parameterized =
@@ -58,6 +62,7 @@ module Routes =
         {
             RouteList = []
             NotFoundHandler = HttpHandler.notFound
+            MethodNotAllowedHandler = defaultMethodNotAllowed
             ExactMatchIndex = Map.empty
             ParameterizedRoutes = []
         }
@@ -69,6 +74,7 @@ module Routes =
         {
             RouteList = [ route ]
             NotFoundHandler = HttpHandler.notFound
+            MethodNotAllowedHandler = defaultMethodNotAllowed
             ExactMatchIndex = index
             ParameterizedRoutes = parameterized
         }
@@ -87,6 +93,7 @@ module Routes =
         {
             RouteList = routes.RouteList @ routes'.RouteList
             NotFoundHandler = routes.NotFoundHandler
+            MethodNotAllowedHandler = routes.MethodNotAllowedHandler
             ExactMatchIndex = mergedIndex
             ParameterizedRoutes = routes.ParameterizedRoutes @ routes'.ParameterizedRoutes
         }
@@ -143,7 +150,7 @@ module Routes =
                     match allowedMethodsFor request routes with
                     | [] -> routes.NotFoundHandler request
                     | methods ->
-                        FIO.succeed (Response.methodNotAllowed (methods |> List.map (fun m -> m.ToString())))
+                        routes.MethodNotAllowedHandler (methods |> List.map (fun m -> m.ToString())) request
 
     /// Adds a pattern and parameter-aware handler to a route collection.
     let add (pattern: RoutePattern) (handler: obj list -> HttpHandler<'E>) (routes: Routes<'E>) =
@@ -181,6 +188,7 @@ module Routes =
         {
             RouteList = routeList
             NotFoundHandler = HttpHandler.notFound
+            MethodNotAllowedHandler = defaultMethodNotAllowed
             ExactMatchIndex = index
             ParameterizedRoutes = parameterized
         }
@@ -197,6 +205,7 @@ module Routes =
         {
             RouteList = transformedRoutes
             NotFoundHandler = func routes.NotFoundHandler
+            MethodNotAllowedHandler = fun methods -> func (routes.MethodNotAllowedHandler methods)
             ExactMatchIndex = index
             ParameterizedRoutes = parameterized
         }

@@ -17,8 +17,15 @@ module private PollingTuning =
     let FiberSpinWaitIterations = 128
     let FiberSpinMissThreshold = 512
     let FiberColdMissThreshold = 65_536
-    let FiberColdSpinWaitIterations = 10
-    let FiberColdWatchLimit = 40_000
+    // The coldest tier sleeps instead of spinning. Reached only after tens of thousands of consecutive
+    // misses on the same entry, so it costs nothing on workloads that block and unblock normally.
+    let ColdSleepMilliseconds = 1
+
+[<Struct>]
+type private CompletionAction =
+    | NoCompletion
+    | CompleteSuccess of successValue: obj
+    | CompleteFailure of failureError: obj
 
 type private EvaluationWorkerConfig =
     {
@@ -60,15 +67,17 @@ and private EvaluationWorker(config: EvaluationWorkerConfig, workerId: int) =
                         let! workItem = config.ActiveWorkItemQueue.ReadAsync()
 
                         if not (workItem.FiberContext.IsCompleted()) then
+                            let fiberContext = workItem.FiberContext
                             try
                                 do! processWorkItem workItem
                             with ex ->
                                 try
-                                    workItem.FiberContext.Complete(Error(ex :> obj))
+                                    fiberContext.Complete(Error(defectError fiberContext ex))
                                 with _ ->
                                     ()
 
-                                raise ex
+                                Console.Error.WriteLine
+                                    $"FIO EvaluationWorker-{workerId} recovered from an unhandled effect exception: {ex}"
             }
 
     interface IDisposable with
@@ -135,7 +144,10 @@ and internal BlockingWorker(config: BlockingWorkerConfig, workerId: int) =
                 do! addVt.AsTask()
         }
 
-    let applyBackoff (maxChannelMiss: int, maxFiberMiss: int, minFiberMiss: int) =
+    // Backoff is tiered by how long an entry has gone unready: spin while a wake-up is plausibly
+    // imminent, then yield, then sleep. The sleeping tier is what stops a fiber blocked on something
+    // that never arrives from holding this worker at 100% CPU indefinitely.
+    let applyBackoff (maxChannelMiss: int, maxFiberMiss: int, minFiberMiss: int) (cancelToken: CancellationToken) =
         task {
             if maxChannelMiss > 0 then
                 if maxChannelMiss < PollingTuning.ChannelSpinMissThreshold then
@@ -143,22 +155,17 @@ and internal BlockingWorker(config: BlockingWorkerConfig, workerId: int) =
                 elif maxChannelMiss < PollingTuning.ChannelYieldMissThreshold then
                     Thread.Yield() |> ignore
                 else
-                    do! Task.Yield()
+                    do! Task.Delay(PollingTuning.ColdSleepMilliseconds, cancelToken)
             elif maxFiberMiss > 0 then
                 if maxFiberMiss < PollingTuning.FiberSpinMissThreshold then
                     Thread.SpinWait PollingTuning.FiberSpinWaitIterations
                 elif minFiberMiss < PollingTuning.FiberColdMissThreshold || channelPending.Count > 0 then
                     do! Task.Yield()
                 else
-                    let mutable watched = 0
-
-                    while watched < PollingTuning.FiberColdWatchLimit
-                          && config.BlockingEntryQueue.Count = 0 do
-                        Thread.SpinWait PollingTuning.FiberColdSpinWaitIterations
-                        watched <- watched + 1
+                    do! Task.Delay(PollingTuning.ColdSleepMilliseconds, cancelToken)
         }
 
-    let processBatch () =
+    let processBatch (cancelToken: CancellationToken) =
         task {
             let mutable processed = 0
             let mutable maxChannelMiss = 0
@@ -198,7 +205,7 @@ and internal BlockingWorker(config: BlockingWorkerConfig, workerId: int) =
             preferChannelFirst <- not preferChannelFirst
 
             if maxChannelMiss > 0 || maxFiberMiss > 0 then
-                do! applyBackoff (maxChannelMiss, maxFiberMiss, minFiberMiss)
+                do! applyBackoff (maxChannelMiss, maxFiberMiss, minFiberMiss) cancelToken
         }
 
     let tryDrainIncoming () =
@@ -237,7 +244,7 @@ and internal BlockingWorker(config: BlockingWorkerConfig, workerId: int) =
                         loop <- false
                     else
                         tryDrainIncoming ()
-                        do! processBatch ()
+                        do! processBatch cancelToken
             }
 
     interface IDisposable with
@@ -257,9 +264,7 @@ and PollingRuntime(config: WorkerConfig) as this =
 
     let blockingEntryQueue = MailboxQueue<BlockingEntry>()
 
-    let mutable currentFiber: FiberContext option = None
 
-    let runLock = obj ()
 
     let struct (blockingWorkers, evaluationWorkers) =
         WorkerBuilders.buildPairedWorkers
@@ -311,13 +316,15 @@ and PollingRuntime(config: WorkerConfig) as this =
         let mutable currentEvaluationSteps = evaluationSteps
         let currentFiberContext = workItem.FiberContext
 
+        let mutable completionAction = NoCompletion
+
         let inline onSuccessComplete value =
             ContStackPool.Return state.ContStack
-            currentFiberContext.Complete <| Ok value
+            completionAction <- CompleteSuccess value
 
         let inline onErrorComplete error =
             ContStackPool.Return state.ContStack
-            currentFiberContext.Complete <| Error error
+            completionAction <- CompleteFailure error
 
         task {
             try
@@ -337,8 +344,8 @@ and PollingRuntime(config: WorkerConfig) as this =
                                 (OutcomeInterrupted error)
                     elif currentEvaluationSteps = 0 then
                         if activeWorkItemQueue.Count > 0 then
-                            let newWorkItem = WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack)
-                            newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                            let newWorkItem =
+                                resumeWith &state (WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack))
                             do! activeWorkItemQueue.WriteAsync newWorkItem
                             state.Completed <- true
                         else
@@ -369,12 +376,11 @@ and PollingRuntime(config: WorkerConfig) as this =
                                         (OutcomeSucceeded value)
                                 else
                                     let newWorkItem =
-                                        WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack))
                                     do! blockingWorker.RescheduleForBlocking <| BlockingChannel(channel, newWorkItem)
                                     state.Completed <- true
-                            | HandleForkEffect(effect, fiber, fiberContext) ->
-                                let _ = setupForkRegistration currentFiberContext fiberContext
+                            | HandleForkEffect(effect, fiber, fiberContext, daemon) ->
+                                attachFork currentFiberContext fiberContext daemon
                                 let workItem = WorkItemPool.Rent(effect, fiberContext, ContStackPool.Rent())
                                 do! activeWorkItemQueue.WriteAsync workItem
                                 processOutcome
@@ -392,8 +398,7 @@ and PollingRuntime(config: WorkerConfig) as this =
                                         value
                                 else
                                     let newWorkItem =
-                                        WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack))
                                     do! blockingWorker.RescheduleForBlocking <| BlockingFiber(fiberContext, newWorkItem)
                                     state.Completed <- true
                             | HandleJoinFirst fiberContexts ->
@@ -406,8 +411,7 @@ and PollingRuntime(config: WorkerConfig) as this =
                                         (OutcomeSucceeded(box index))
                                 | _ ->
                                     let newWorkItem =
-                                        WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack))
                                     parkJoinFirstOnHooks fiberContexts currentFiberContext state.InterruptionSuppressed newWorkItem activeWorkItemQueue
                                     state.Completed <- true
                             | HandleJoinAllFailFast fiberContexts ->
@@ -420,16 +424,11 @@ and PollingRuntime(config: WorkerConfig) as this =
                                         (OutcomeSucceeded(box outcome))
                                 | ValueNone ->
                                     let newWorkItem =
-                                        WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack))
                                     parkJoinAllFailFastOnQueue fiberContexts currentFiberContext state.InterruptionSuppressed newWorkItem activeWorkItemQueue
                                     state.Completed <- true
                             | HandleAwaitTask(awaited, onError) ->
-                                let waited =
-                                    if state.InterruptionSuppressed > 0 then
-                                        awaited
-                                    else
-                                        awaited.WaitAsync currentFiberContext.CancellationToken
+                                let waited = awaitedTask awaited state.InterruptionSuppressed currentFiberContext
 
                                 if waited.IsCompletedSuccessfully then
                                     processOutcome
@@ -438,45 +437,22 @@ and PollingRuntime(config: WorkerConfig) as this =
                                         onErrorComplete
                                         (OutcomeSucceeded waited.Result)
                                 else
-                                    let fiberContext = currentFiberContext
-                                    let suppressed = state.InterruptionSuppressed
-                                    let contStack = state.ContStack
+                                    parkOnTask
+                                        waited
+                                        currentFiberContext
+                                        state.ContStack
+                                        state.InterruptionSuppressed
+                                        onError
+                                        (fun workItem -> activeWorkItemQueue.WriteAsync workItem |> ignore)
 
-                                    let resume () =
-                                        let resumeEffect =
-                                            if waited.IsCompletedSuccessfully then
-                                                Success waited.Result
-                                            elif waited.IsCanceled
-                                                 && fiberContext.CancellationToken.IsCancellationRequested then
-                                                Interrupt(ExplicitInterrupt, "Task has been cancelled.")
-                                            else
-                                                let ex =
-                                                    match waited.Exception with
-                                                    | null -> OperationCanceledException() :> exn
-                                                    | aggregate ->
-                                                        match aggregate.InnerException with
-                                                        | null -> aggregate :> exn
-                                                        | inner -> inner
-                                                let error =
-                                                    try onError ex
-                                                    with _ -> ex :> obj
-                                                Failure error
-
-                                        let resumeWorkItem =
-                                            {
-                                                Effect = resumeEffect
-                                                FiberContext = fiberContext
-                                                ContStack = contStack
-                                                InterruptionSuppressed = suppressed
-                                            }
-
-                                        try
-                                            activeWorkItemQueue.WriteAsync resumeWorkItem |> ignore
-                                        with _ ->
-                                            ()
-
-                                    waited.GetAwaiter().OnCompleted(Action resume)
                                     state.Completed <- true
+                match completionAction with
+                | CompleteSuccess value ->
+                    do! currentFiberContext.CompleteAndReschedule(Ok value, activeWorkItemQueue)
+                | CompleteFailure error ->
+                    do! currentFiberContext.CompleteAndReschedule(Error error, activeWorkItemQueue)
+                | NoCompletion -> ()
+
                 return ()
             finally
                 if not state.Completed then
@@ -484,28 +460,15 @@ and PollingRuntime(config: WorkerConfig) as this =
                 WorkItemPool.Return workItem
         }
 
-    member private _.Reset () =
-        activeWorkItemQueue.Clear()
-        blockingEntryQueue.Clear()
-
+    /// Schedules the given effect on a new fiber and returns immediately with a handle to it. Safe to
+    /// call concurrently and as often as you like: it never waits for, interrupts, or discards any
+    /// fiber already running on this runtime.
     override _.Run<'A, 'E> (effect: FIO<'A, 'E>) : Fiber<'A, 'E> =
-        lock runLock <| fun () ->
-            match currentFiber with
-            | Some fiberContext when not (fiberContext.IsTerminal()) ->
-                fiberContext.Task.GetAwaiter().GetResult() |> ignore
-            | _ -> ()
+        let fiber = new Fiber<'A, 'E>()
 
-            match currentFiber with
-            | Some fiberContext -> fiberContext.Cancel()
-            | None -> ()
+        let workItem =
+            WorkItemPool.Rent(effect.UpcastBoth(), fiber.Context, ContStackPool.Rent())
 
-            this.Reset()
-            let fiber = new Fiber<'A, 'E>()
-            currentFiber <- Some fiber.Context
+        activeWorkItemQueue.WriteAsync workItem |> ignore
 
-            let workItem =
-                WorkItemPool.Rent(effect.UpcastBoth(), fiber.Context, ContStackPool.Rent())
-
-            activeWorkItemQueue.WriteAsync workItem |> ignore
-
-            fiber
+        fiber

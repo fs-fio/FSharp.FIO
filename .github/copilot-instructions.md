@@ -171,9 +171,9 @@ Two tiers — see [`docs/COMMENT_STYLE.md`](../docs/COMMENT_STYLE.md):
 
 ## CI / Release
 
-- Tests run on Ubuntu, Windows, macOS; Ubuntu collects coverage (Codecov)
-- Benchmarks run on Ubuntu only (main branch + PRs)
-- Publishing triggered by `v*` git tags — packs and pushes the NuGet packages
+- Tests run on Ubuntu, Windows, macOS (`main` + PRs to `main`), with `FIO_RUN_STRESS=1` and a 30-minute timeout; results are uploaded as TRX artifacts. No coverage is collected in CI — Codecov was removed because it never received an upload
+- Benchmarks run on Ubuntu only (main branch + PRs), publishing Pingpong history to <https://fs-fio.github.io/fio/dev/bench/>. It is a tracker, not a gate
+- Publishing triggered by `v*` git tags — packs and pushes the NuGet packages. The push step is gated on `refs/tags/`, so a manual dispatch is a dry run
 
 ## Architecture Change Checklist
 

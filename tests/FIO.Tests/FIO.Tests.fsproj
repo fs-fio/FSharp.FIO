@@ -27,6 +27,7 @@
         <Compile Include="Lib/ConsoleTests.fs" />
 
         <!-- Framework -->
+        <Compile Include="Runtime/ConformanceTests.fs" />
         <Compile Include="Framework/AppTests.fs" />
 
         <Compile Include="Program.fs" />

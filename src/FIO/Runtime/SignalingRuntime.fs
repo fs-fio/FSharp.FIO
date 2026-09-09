@@ -35,17 +35,20 @@ and private EvaluationWorker(config: EvaluationWorkerConfig, workerId: int) =
                         let! workItem = config.ActiveWorkItemQueue.ReadAsync()
 
                         if not (workItem.FiberContext.IsCompleted()) then
+                            let fiberContext = workItem.FiberContext
                             try
                                 do! processWorkItem workItem
                             with ex ->
                                 try
                                     do!
-                                        workItem.FiberContext.CompleteAndReschedule(
-                                            Error(ex :> obj),
+                                        fiberContext.CompleteAndReschedule(
+                                            Error(defectError fiberContext ex),
                                             config.ActiveWorkItemQueue)
                                 with _ ->
                                     ()
-                                raise ex
+
+                                Console.Error.WriteLine
+                                    $"FIO EvaluationWorker-{workerId} recovered from an unhandled effect exception: {ex}"
             }
 
     interface IDisposable with
@@ -61,9 +64,7 @@ and SignalingRuntime(config: WorkerConfig) as this =
 
     let activeWorkItemQueue = MailboxQueue<WorkItem>()
 
-    let mutable currentFiber: FiberContext option = None
 
-    let runLock = obj ()
 
     let evaluationWorkers =
         List.init config.EvaluationWorkers (fun i ->
@@ -124,8 +125,8 @@ and SignalingRuntime(config: WorkerConfig) as this =
                                 (OutcomeInterrupted error)
                     elif currentEvaluationSteps = 0 then
                         if activeWorkItemQueue.Count > 0 then
-                            let newWorkItem = WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack)
-                            newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                            let newWorkItem =
+                                resumeWith &state (WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack))
                             do! activeWorkItemQueue.WriteAsync newWorkItem
                             state.Completed <- true
                         else
@@ -188,8 +189,8 @@ and SignalingRuntime(config: WorkerConfig) as this =
 
                                         waited.GetAwaiter().OnCompleted(Action resume)
                                         state.Completed <- true
-                            | HandleForkEffect(effect, fiber, fiberContext) ->
-                                let _ = setupForkRegistration currentFiberContext fiberContext
+                            | HandleForkEffect(effect, fiber, fiberContext, daemon) ->
+                                attachFork currentFiberContext fiberContext daemon
                                 let workItem = WorkItemPool.Rent(effect, fiberContext, ContStackPool.Rent())
                                 do! activeWorkItemQueue.WriteAsync workItem
                                 processOutcome
@@ -207,8 +208,7 @@ and SignalingRuntime(config: WorkerConfig) as this =
                                         value
                                 else
                                     let newWorkItem =
-                                        WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack))
                                     let waiter =
                                         parkBlockingWaiter currentFiberContext state.InterruptionSuppressed newWorkItem (fun wi ->
                                             activeWorkItemQueue.WriteAsync wi |> ignore)
@@ -225,8 +225,7 @@ and SignalingRuntime(config: WorkerConfig) as this =
                                         (OutcomeSucceeded(box index))
                                 | _ ->
                                     let newWorkItem =
-                                        WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack))
                                     parkJoinFirstOnQueue fiberContexts currentFiberContext state.InterruptionSuppressed newWorkItem activeWorkItemQueue
                                     state.Completed <- true
                             | HandleJoinAllFailFast fiberContexts ->
@@ -239,16 +238,11 @@ and SignalingRuntime(config: WorkerConfig) as this =
                                         (OutcomeSucceeded(box outcome))
                                 | ValueNone ->
                                     let newWorkItem =
-                                        WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack)
-                                    newWorkItem.InterruptionSuppressed <- state.InterruptionSuppressed
+                                        resumeWith &state (WorkItemPool.Rent(state.Effect, currentFiberContext, state.ContStack))
                                     parkJoinAllFailFastOnQueue fiberContexts currentFiberContext state.InterruptionSuppressed newWorkItem activeWorkItemQueue
                                     state.Completed <- true
                             | HandleAwaitTask(awaited, onError) ->
-                                let waited =
-                                    if state.InterruptionSuppressed > 0 then
-                                        awaited
-                                    else
-                                        awaited.WaitAsync currentFiberContext.CancellationToken
+                                let waited = awaitedTask awaited state.InterruptionSuppressed currentFiberContext
 
                                 if waited.IsCompletedSuccessfully then
                                     processOutcome
@@ -257,44 +251,14 @@ and SignalingRuntime(config: WorkerConfig) as this =
                                         onErrorComplete
                                         (OutcomeSucceeded waited.Result)
                                 else
-                                    let fiberContext = currentFiberContext
-                                    let suppressed = state.InterruptionSuppressed
-                                    let contStack = state.ContStack
+                                    parkOnTask
+                                        waited
+                                        currentFiberContext
+                                        state.ContStack
+                                        state.InterruptionSuppressed
+                                        onError
+                                        (fun workItem -> activeWorkItemQueue.WriteAsync workItem |> ignore)
 
-                                    let resume () =
-                                        let resumeEffect =
-                                            if waited.IsCompletedSuccessfully then
-                                                Success waited.Result
-                                            elif waited.IsCanceled
-                                                 && fiberContext.CancellationToken.IsCancellationRequested then
-                                                Interrupt(ExplicitInterrupt, "Task has been cancelled.")
-                                            else
-                                                let ex =
-                                                    match waited.Exception with
-                                                    | null -> OperationCanceledException() :> exn
-                                                    | aggregate ->
-                                                        match aggregate.InnerException with
-                                                        | null -> aggregate :> exn
-                                                        | inner -> inner
-                                                let error =
-                                                    try onError ex
-                                                    with _ -> ex :> obj
-                                                Failure error
-
-                                        let resumeWorkItem =
-                                            {
-                                                Effect = resumeEffect
-                                                FiberContext = fiberContext
-                                                ContStack = contStack
-                                                InterruptionSuppressed = suppressed
-                                            }
-
-                                        try
-                                            activeWorkItemQueue.WriteAsync resumeWorkItem |> ignore
-                                        with _ ->
-                                            ()
-
-                                    waited.GetAwaiter().OnCompleted(Action resume)
                                     state.Completed <- true
 
                 match completionAction with
@@ -312,27 +276,15 @@ and SignalingRuntime(config: WorkerConfig) as this =
                 WorkItemPool.Return workItem
         }
 
-    member private _.Reset () =
-        activeWorkItemQueue.Clear()
-
+    /// Schedules the given effect on a new fiber and returns immediately with a handle to it. Safe to
+    /// call concurrently and as often as you like: it never waits for, interrupts, or discards any
+    /// fiber already running on this runtime.
     override _.Run<'A, 'E> (effect: FIO<'A, 'E>) : Fiber<'A, 'E> =
-        lock runLock (fun () ->
-            match currentFiber with
-            | Some fiberContext when not (fiberContext.IsTerminal()) ->
-                fiberContext.Task.GetAwaiter().GetResult() |> ignore
-            | _ -> ()
+        let fiber = new Fiber<'A, 'E>()
 
-            match currentFiber with
-            | Some fiberContext -> fiberContext.Cancel()
-            | None -> ()
+        let workItem =
+            WorkItemPool.Rent(effect.UpcastBoth(), fiber.Context, ContStackPool.Rent())
 
-            this.Reset()
-            let fiber = new Fiber<'A, 'E>()
-            currentFiber <- Some fiber.Context
+        activeWorkItemQueue.WriteAsync workItem |> ignore
 
-            let workItem =
-                WorkItemPool.Rent(effect.UpcastBoth(), fiber.Context, ContStackPool.Rent())
-
-            activeWorkItemQueue.WriteAsync workItem |> ignore
-
-            fiber)
+        fiber
