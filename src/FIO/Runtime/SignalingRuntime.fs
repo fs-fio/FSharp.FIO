@@ -64,8 +64,6 @@ and SignalingRuntime(config: WorkerConfig) as this =
 
     let activeWorkItemQueue = MailboxQueue<WorkItem>()
 
-
-
     let evaluationWorkers =
         List.init config.EvaluationWorkers (fun i ->
             new EvaluationWorker(
@@ -173,7 +171,11 @@ and SignalingRuntime(config: WorkerConfig) as this =
                                             try
                                                 let resumeEffect =
                                                     if suppressed = 0 && fiberContext.CancellationToken.IsCancellationRequested then
-                                                        Interrupt(ExplicitInterrupt, "Fiber was interrupted while blocked on a channel read.")
+                                                        match interruptionFor fiberContext "Fiber was interrupted while blocked on a channel read." with
+                                                        | :? FiberInterruptedException as interruption ->
+                                                            Interrupt(interruption.cause, interruption.message)
+                                                        | _ ->
+                                                            Interrupt(ExplicitInterrupt, "Fiber was interrupted while blocked on a channel read.")
                                                     else
                                                         readEffect
                                                 let resumeWorkItem =

@@ -249,6 +249,15 @@ let inline attachFork (parentContext: FiberContext) (childContext: FiberContext)
         childContext.AddRegistration registration
         childContext.AttachTo parentContext
 
+let interruptionFor (fiberContext: FiberContext) (fallbackMessage: string) : obj =
+    let task = fiberContext.Task
+    if task.IsCompletedSuccessfully then
+        match task.Result with
+        | Error error -> error
+        | Ok _ -> FiberInterruptedException(fiberContext.Id, ExplicitInterrupt, fallbackMessage) :> obj
+    else
+        FiberInterruptedException(fiberContext.Id, ExplicitInterrupt, fallbackMessage) :> obj
+
 let inline defectError (fiberContext: FiberContext) (ex: exn) : obj =
     FiberInterruptedException(fiberContext.Id, Defect ex, ex.Message) :> obj
 
@@ -272,7 +281,9 @@ let settledTaskEffect (waited: Task<obj>) (fiberContext: FiberContext) (onError:
     if waited.IsCompletedSuccessfully then
         Success waited.Result
     elif waited.IsCanceled && fiberContext.CancellationToken.IsCancellationRequested then
-        Interrupt(ExplicitInterrupt, "Task has been cancelled.")
+        match interruptionFor fiberContext "Task has been cancelled." with
+        | :? FiberInterruptedException as interruption -> Interrupt(interruption.cause, interruption.message)
+        | _ -> Interrupt(ExplicitInterrupt, "Task has been cancelled.")
     else
         let ex =
             match waited.Exception with

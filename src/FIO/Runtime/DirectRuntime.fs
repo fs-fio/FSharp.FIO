@@ -90,11 +90,7 @@ type DirectRuntime() =
                                             &state
                                             onSuccessComplete
                                             onErrorComplete
-                                            (OutcomeInterrupted (FiberInterruptedException(
-                                                currentFiberContext.Id,
-                                                ExplicitInterrupt,
-                                                "Fiber was interrupted while blocked on a channel read."
-                                            )))
+                                            (OutcomeInterrupted (interruptionFor currentFiberContext "Fiber was interrupted while blocked on a channel read."))
                             | HandleForkEffect(effect, fiber, fiberContext, daemon) ->
                                 attachFork currentFiberContext fiberContext daemon
                                 Task.Run(fun () -> this.RunFiber effect fiberContext :> Task) |> ignore
@@ -119,11 +115,7 @@ type DirectRuntime() =
                                         &state
                                         onSuccessComplete
                                         onErrorComplete
-                                        (OutcomeInterrupted (FiberInterruptedException(
-                                            currentFiberContext.Id,
-                                            ExplicitInterrupt,
-                                            "Fiber was interrupted while blocked on a fiber join."
-                                        )))
+                                        (OutcomeInterrupted (interruptionFor currentFiberContext "Fiber was interrupted while blocked on a fiber join."))
                             | HandleJoinFirst fiberContexts ->
                                 let contexts = List.toArray fiberContexts
                                 try
@@ -147,11 +139,7 @@ type DirectRuntime() =
                                         &state
                                         onSuccessComplete
                                         onErrorComplete
-                                        (OutcomeInterrupted (FiberInterruptedException(
-                                            currentFiberContext.Id,
-                                            ExplicitInterrupt,
-                                            "Fiber was interrupted while blocked on a fiber join."
-                                        )))
+                                        (OutcomeInterrupted (interruptionFor currentFiberContext "Fiber was interrupted while blocked on a fiber join."))
                             | HandleJoinAllFailFast fiberContexts ->
                                 match tryCompleteJoinAll fiberContexts with
                                 | ValueSome outcome ->
@@ -180,11 +168,7 @@ type DirectRuntime() =
                                             &state
                                             onSuccessComplete
                                             onErrorComplete
-                                            (OutcomeInterrupted (FiberInterruptedException(
-                                                currentFiberContext.Id,
-                                                ExplicitInterrupt,
-                                                "Fiber was interrupted while blocked on a fiber join."
-                                            )))
+                                            (OutcomeInterrupted (interruptionFor currentFiberContext "Fiber was interrupted while blocked on a fiber join."))
                             | HandleAwaitTask(task, onError) ->
                                 try
                                     let! value =
@@ -201,11 +185,7 @@ type DirectRuntime() =
                                         &state
                                         onSuccessComplete
                                         onErrorComplete
-                                        (OutcomeInterrupted (FiberInterruptedException(
-                                            currentFiberContext.Id,
-                                            ExplicitInterrupt,
-                                            "Task has been cancelled."
-                                        )))
+                                        (OutcomeInterrupted (interruptionFor currentFiberContext "Task has been cancelled."))
                                 | ex ->
                                     processOutcome
                                         &state

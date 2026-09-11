@@ -282,11 +282,11 @@ and [<Sealed; AllowNullLiteral>] internal FiberContext() =
         let message = defaultArg message "Fiber was interrupted."
         if Volatile.Read &completing = 0
            && tryTransition &state (int FiberContextState.Running) (int FiberContextState.Interrupted) then
+            let interruptError = Error(FiberInterruptedException(id, cause, message) :> obj)
+            resultSource.TrySetResult interruptError |> ignore
             cancelSource.Cancel(throwOnFirstException = false)
             this.CancelChildScope()
             this.DisposeRegistrations()
-            let interruptError = Error(FiberInterruptedException(id, cause, message) :> obj)
-            resultSource.TrySetResult interruptError |> ignore
             this.InvokeOnTerminal()
 
     member internal _.Cancel () =
