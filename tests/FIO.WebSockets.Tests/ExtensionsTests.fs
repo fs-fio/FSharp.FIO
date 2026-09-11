@@ -15,7 +15,6 @@ let extensionsTests =
     testList
         "Extensions"
         [
-
             testAllRuntimes "SendJson/ReceiveJson roundtrip" (fun runtime ->
                 withTestServer
                     echoHandler
@@ -81,4 +80,78 @@ let extensionsTests =
                             do! ws.Close()
                         })
                     runtime)
+
+            testList
+                "Frame-type mismatches"
+                [
+                    testAllRuntimes "ReceiveString rejects a binary frame" (fun runtime ->
+                        withTestServer
+                            echoHandler
+                            (fun port ->
+                                fio {
+                                    let! ws = WebSocketClient.connectDefault $"ws://localhost:{port}/"
+                                    do! ws.SendBytes [| 1uy; 2uy; 3uy |]
+
+                                    let! outcome =
+                                        (ws.ReceiveString())
+                                            .Map(fun text -> Ok text)
+                                            .CatchAll(fun error -> FIO.succeed (Error error))
+
+                                    do! (ws.Close()).CatchAll(fun _ -> FIO.unit ())
+
+                                    match outcome with
+                                    | Error error ->
+                                        Expect.stringContains
+                                            (error.ToString())
+                                            "got binary"
+                                            "ReceiveString must say the frame was binary"
+                                    | Ok text -> failtest $"Expected a typed failure but received {text}"
+                                })
+                            runtime)
+
+                    testAllRuntimes "ReceiveBytes rejects a text frame" (fun runtime ->
+                        withTestServer
+                            echoHandler
+                            (fun port ->
+                                fio {
+                                    let! ws = WebSocketClient.connectDefault $"ws://localhost:{port}/"
+                                    do! ws.SendString "not bytes"
+
+                                    let! outcome =
+                                        (ws.ReceiveBytes())
+                                            .Map(fun data -> Ok data)
+                                            .CatchAll(fun error -> FIO.succeed (Error error))
+
+                                    do! (ws.Close()).CatchAll(fun _ -> FIO.unit ())
+
+                                    match outcome with
+                                    | Error error ->
+                                        Expect.stringContains
+                                            (error.ToString())
+                                            "got text"
+                                            "ReceiveBytes must say the frame was text"
+                                    | Ok data -> failtest $"Expected a typed failure but received {data.Length} bytes"
+                                })
+                            runtime)
+
+                    testAllRuntimes "ReceiveJson fails when the connection closes first" (fun runtime ->
+                        withTestServer
+                            (fun ws -> ws.Close())
+                            (fun port ->
+                                fio {
+                                    let! ws = WebSocketClient.connectDefault $"ws://localhost:{port}/"
+
+                                    let! outcome =
+                                        (ws.ReceiveJson<TestMessage>())
+                                            .Map(fun value -> Ok value)
+                                            .CatchAll(fun error -> FIO.succeed (Error error))
+
+                                    do! (ws.Close()).CatchAll(fun _ -> FIO.unit ())
+
+                                    match outcome with
+                                    | Error _ -> ()
+                                    | Ok value -> failtest $"Expected a failure on a closed connection, got {value}"
+                                })
+                            runtime)
+                ]
         ]

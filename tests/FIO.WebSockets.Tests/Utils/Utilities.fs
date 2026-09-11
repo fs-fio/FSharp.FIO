@@ -91,7 +91,7 @@ let echoHandler (ws: WebSocket) =
 
     loop ()
 
-let private runWithTimeout (runtime: FIORuntime) (effect: FIO<'A, WsError>) =
+let runWithTimeout (runtime: FIORuntime) (effect: FIO<'A, WsError>) =
     let fiber = runtime.Run effect
     match
         fiber.Task()
@@ -102,7 +102,7 @@ let private runWithTimeout (runtime: FIORuntime) (effect: FIO<'A, WsError>) =
     | Failed error -> failtest $"Effect failed: {error}"
     | Interrupted ex -> failtest $"Interrupted: {ex.Message}"
 
-let private startTestListener () =
+let startTestListener () =
     let rec attempt remaining =
         fio {
             let port = findAvailablePort ()
@@ -124,6 +124,40 @@ let private startTestListener () =
         }
 
     attempt 10
+
+let private portConflict (error: WsError) =
+    match error with
+    | GeneralError message -> message.Contains "conflicts with an existing registration"
+    | _ -> false
+
+let withServedUrl (startServer: string -> FIO<unit, WsError>) (action: string -> FIO<'A, WsError>) =
+    let rec attempt remaining =
+        fio {
+            let port = findAvailablePort ()
+            let! serverFiber = (startServer $"http://localhost:{port}/").Fork()
+
+            let serverDied: FIO<'A, WsError> =
+                (serverFiber.Join())
+                    .FlatMap(fun _ -> FIO.fail (ConnectionFailed "server exited before the client connected"))
+
+            let! outcome =
+                ((action $"ws://localhost:{port}/").RaceFirst serverDied)
+                    .Map(fun value -> Ok value)
+                    .CatchAll(fun error -> FIO.succeed (Error error))
+
+            do! (serverFiber.InterruptNow()).CatchAll(fun _ -> FIO.unit ())
+
+            match outcome with
+            | Ok value -> return value
+            | Error error when remaining > 0 && portConflict error -> return! attempt (remaining - 1)
+            | Error error -> return! FIO.fail error
+        }
+
+    attempt 5
+
+let connectWhenListening (url: string) =
+    (WebSocketClient.connectDefault url)
+        .Retry 60 (fun (_, _, _) -> FIO.sleep (TimeSpan.FromMilliseconds 50.0) WsError.fromException)
 
 let withTestServer (handler: WebSocket -> FIO<unit, WsError>) (action: int -> FIO<'A, WsError>) (runtime: FIORuntime) =
     let effect =

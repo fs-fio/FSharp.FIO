@@ -13,7 +13,6 @@ let routesTests =
     testList
         "Routes"
         [
-
             testAllRuntimes "empty dispatches to 404" (fun runtime ->
                 let resp = dispatchAndRun runtime Routes.empty (makeGetRequest "/anything")
 
@@ -196,6 +195,58 @@ let routesTests =
                         | ResponseBody.Text t -> Expect.equal t "id=99" "Int param"
                         | _ -> failtest "Expected Text body")
 
+                    testAllRuntimes "postInt extracts integer parameter" (fun runtime ->
+                        let routes =
+                            TypedRoutes.postInt [ "users" ] [] (fun id -> HttpHandler.text $"posted={id}")
+
+                        let resp = dispatchAndRun runtime routes (makeRequest HttpMethod.POST "/users/7")
+
+                        match resp.Body with
+                        | ResponseBody.Text t -> Expect.equal t "posted=7" "postInt must bind the id"
+                        | other -> failtest $"Expected a text body, got {other}")
+
+                    testAllRuntimes "putInt extracts integer parameter" (fun runtime ->
+                        let routes =
+                            TypedRoutes.putInt [ "users" ] [] (fun id -> HttpHandler.text $"put={id}")
+
+                        let resp = dispatchAndRun runtime routes (makeRequest HttpMethod.PUT "/users/12")
+
+                        match resp.Body with
+                        | ResponseBody.Text t -> Expect.equal t "put=12" "putInt must bind the id"
+                        | other -> failtest $"Expected a text body, got {other}")
+
+                    testAllRuntimes "deleteInt extracts integer parameter" (fun runtime ->
+                        let routes =
+                            TypedRoutes.deleteInt [ "users" ] [] (fun id -> HttpHandler.text $"deleted={id}")
+
+                        let resp = dispatchAndRun runtime routes (makeRequest HttpMethod.DELETE "/users/3")
+
+                        match resp.Body with
+                        | ResponseBody.Text t -> Expect.equal t "deleted=3" "deleteInt must bind the id"
+                        | other -> failtest $"Expected a text body, got {other}")
+
+                    testAllRuntimes "an int route does not match a non-integer segment" (fun runtime ->
+                        let reached = ref false
+
+                        let routes =
+                            TypedRoutes.getInt [ "users" ] [] (fun id ->
+                                fun request ->
+                                    reached.Value <- true
+                                    HttpHandler.text $"id={id}" request)
+
+                        let resp = dispatchAndRun runtime routes (makeRequest HttpMethod.GET "/users/abc")
+
+                        Expect.isFalse reached.Value "A non-integer segment must never reach the typed handler"
+                        Expect.equal resp.Status HttpStatusCode.NotFound "It must fall through to not-found")
+
+                    testAllRuntimes "an int route does not match a wrong method" (fun runtime ->
+                        let routes =
+                            TypedRoutes.postInt [ "users" ] [] (fun id -> HttpHandler.text $"posted={id}")
+
+                        let resp = dispatchAndRun runtime routes (makeRequest HttpMethod.GET "/users/7")
+
+                        Expect.notEqual resp.Status HttpStatusCode.OK "A GET must not reach a POST-only typed route")
+
                     testAllRuntimes "getString extracts string parameter" (fun runtime ->
                         let routes =
                             TypedRoutes.getString [ "items" ] [] (fun name -> HttpHandler.text $"name={name}")
@@ -231,5 +282,45 @@ let routesTests =
                         Expect.equal rU.Status HttpStatusCode.OK "PUT"
                         Expect.equal rD.Status HttpStatusCode.OK "DELETE"
                         Expect.equal rA.Status HttpStatusCode.OK "PATCH")
+                ]
+
+            testList
+                "RouteBuilder CE (shipped public API, previously never executed)"
+                [
+                    testAllRuntimes "RouteBuilder routes CE yields an empty collection" (fun runtime ->
+                        let collected: Routes<exn> = RouteBuilder.routes { () }
+                        let request = makeGetRequest "/anything"
+                        let response = dispatchAndRun runtime collected request
+
+                        Expect.equal response.Status HttpStatusCode.NotFound "An empty CE must route nothing")
+
+                    testAllRuntimes "RouteBuilder routes CE combines yielded collections" (fun runtime ->
+                        let collected: Routes<exn> =
+                            RouteBuilder.routes {
+                                yield SimpleRoutes.get "/a" (HttpHandler.text "A")
+                                yield SimpleRoutes.get "/b" (HttpHandler.text "B")
+                            }
+
+                        let a = dispatchAndRun runtime collected (makeGetRequest "/a")
+                        let b = dispatchAndRun runtime collected (makeGetRequest "/b")
+
+                        match a.Body, b.Body with
+                        | ResponseBody.Text ta, ResponseBody.Text tb ->
+                            Expect.equal ta "A" "First yielded route must be reachable"
+                            Expect.equal tb "B" "Second yielded route must be reachable"
+                        | other -> failtest $"Expected text bodies from both routes, got {other}")
+
+                    testAllRuntimes "RouteBuilder routes CE preserves first-match order" (fun runtime ->
+                        let collected: Routes<exn> =
+                            RouteBuilder.routes {
+                                yield SimpleRoutes.get "/dup" (HttpHandler.text "first")
+                                yield SimpleRoutes.get "/dup" (HttpHandler.text "second")
+                            }
+
+                        let response = dispatchAndRun runtime collected (makeGetRequest "/dup")
+
+                        match response.Body with
+                        | ResponseBody.Text t -> Expect.equal t "first" "The earlier yielded route must win"
+                        | other -> failtest $"Expected a text body, got {other}")
                 ]
         ]

@@ -72,7 +72,7 @@ let echoHandler (socket: Socket) =
         do! socket.SendBytes data
     }
 
-let private runWithTimeout (runtime: FIORuntime) (effect: FIO<'A, SocketError>) =
+let runWithTimeout (runtime: FIORuntime) (effect: FIO<'A, SocketError>) =
     let fiber = runtime.Run effect
     match
         fiber.Task()
@@ -82,6 +82,10 @@ let private runWithTimeout (runtime: FIORuntime) (effect: FIO<'A, SocketError>) 
     | Succeeded value -> value
     | Failed error -> failtest $"Effect failed: {error}"
     | Interrupted ex -> failtest $"Interrupted: {ex.Message}"
+
+let connectWhenListening (host: string) (port: int) =
+    (SocketClient.connectWith host port)
+        .Retry 60 (fun (_, _, _) -> FIO.sleep (TimeSpan.FromMilliseconds 50.0) SocketError.fromException)
 
 let withTestServer
     (handler: Socket -> FIO<unit, SocketError>)

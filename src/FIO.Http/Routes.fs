@@ -218,8 +218,8 @@ module RouteBuilder =
 
     type RouteCollector<'E>() =
 
-        member _.Yield _ =
-            Routes.empty<'E>
+        member _.Yield (routes: Routes<'E>) =
+            routes
 
         member _.Combine (routes: Routes<'E>, routes': Routes<'E>) =
             Routes.combine routes routes'

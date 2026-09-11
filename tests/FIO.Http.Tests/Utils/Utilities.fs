@@ -13,7 +13,6 @@ open System
 open System.Net
 open System.Text
 open System.Threading
-
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Hosting
 open Microsoft.Extensions.Logging
@@ -79,6 +78,21 @@ let dispatchAndRun (runtime: FIORuntime) (routes: Routes<exn>) (request: HttpReq
     | Failed error -> failtest $"Effect failed: {error}"
     | Interrupted ex -> failtest $"Interrupted: {ex.Message}"
 
+let getWhenListening (url: string) =
+    use client = new Http.HttpClient()
+    let deadline = DateTime.UtcNow.AddSeconds 10.0
+    let mutable result = None
+
+    while result.IsNone && DateTime.UtcNow < deadline do
+        try
+            result <- Some(client.GetStringAsync(url).Result)
+        with _ ->
+            Thread.Sleep 25
+
+    match result with
+    | Some body -> body
+    | None -> failtest $"Server at {url} never became ready"
+
 let findAvailablePort () =
     let listener = new Sockets.TcpListener(IPAddress.Loopback, 0)
     listener.Start()
@@ -86,7 +100,7 @@ let findAvailablePort () =
     listener.Stop()
     port
 
-let private startTestHttpApp (routes: Routes<exn>) (runtime: DefaultRuntime) =
+let private startTestHttpApp (routes: Routes<exn>) (maxBodySize: int64) (runtime: DefaultRuntime) =
     let rec attempt remaining =
         let port = findAvailablePort ()
         let config = ServerConfig.create "127.0.0.1" port
@@ -105,7 +119,7 @@ let private startTestHttpApp (routes: Routes<exn>) (runtime: DefaultRuntime) =
             Microsoft.AspNetCore.Http.RequestDelegate(fun ctx ->
                 task {
                     try
-                        do! KestrelBridge.handleRequest runtime routes config.MaxRequestBodySize ctx
+                        do! KestrelBridge.handleRequest runtime routes maxBodySize ctx
                     with ex ->
                         let message =
                             sprintf "%s\n%s" ex.Message (if isNull ex.StackTrace then "" else ex.StackTrace)
@@ -119,15 +133,15 @@ let private startTestHttpApp (routes: Routes<exn>) (runtime: DefaultRuntime) =
             app.StartAsync().Wait()
             port, app
         with _ when remaining > 0 ->
-            (try app.DisposeAsync().AsTask().Wait() with _ -> ())
+            try app.DisposeAsync().AsTask().Wait() with _ -> ()
             Thread.Sleep 50
             attempt (remaining - 1)
 
     attempt 10
 
-let withTestHttpServer (routes: Routes<exn>) (action: int -> unit) =
+let withTestHttpServerMaxBody (maxBodySize: int64) (routes: Routes<exn>) (action: int -> unit) =
     let runtime = new DefaultRuntime()
-    let port, app = startTestHttpApp routes runtime
+    let port, app = startTestHttpApp routes maxBodySize runtime
 
     try
         Thread.Sleep 200
@@ -136,3 +150,6 @@ let withTestHttpServer (routes: Routes<exn>) (action: int -> unit) =
         app.StopAsync().Wait()
         app.DisposeAsync().AsTask().Wait()
         (runtime :> IDisposable).Dispose()
+
+let withTestHttpServer (routes: Routes<exn>) (action: int -> unit) =
+    withTestHttpServerMaxBody (ServerConfig.create "127.0.0.1" 0).MaxRequestBodySize routes action
