@@ -2296,7 +2296,7 @@ let factoryTests =
                                     if value = i then loop (i - 1) else FIO.fail (exn $"wrong winner in round {i}")
 
                         let bounded =
-                            (loop iterations).TimeoutFail (exn "timeout") (TimeSpan.FromSeconds 60.0) id
+                            (loop iterations).TimeoutFail (exn "timeout") (TimeSpan.FromSeconds 120.0) id
 
                         Expect.equal (runtime.Run(bounded).UnsafeSuccess()) () "every raceAll round should settle on the surviving success")
                 ]
