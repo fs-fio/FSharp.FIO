@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783888759100,
+  "lastUpdate": 1789147418982,
   "repoUrl": "https://github.com/fs-fio/fio",
   "entries": {
     "Benchmark": [
@@ -351,6 +351,50 @@ window.BENCHMARK_DATA = {
           {
             "name": "Pingpong - WorkStealing-2-200-1",
             "value": 215.34197980000002,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "hey@itsdaniel.dk",
+            "name": "Daniel Larsen",
+            "username": "itsdanieldk"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b41b95994d44190c44ec35372b731bda1106cad6",
+          "message": "Fix interruptions and improve CI and test suite (#73)\n\n* bulk update\n\n* chore: cleanup\n\n* fix: interruption cause lost when a fiber is interrupted while blocked\n\n* fix: make WebSocketServer.close/abort suppress, matching ServerSocket\n\n* fix: ci pipeline repair\n\n* fix: test suite improvements\n\n* chore: README updates\n\n* fix: test contention",
+          "timestamp": "2026-09-11T19:21:57+02:00",
+          "tree_id": "a4e359967bf834800a1eb81419f7c0d7ee0421e7",
+          "url": "https://github.com/fs-fio/fio/commit/b41b95994d44190c44ec35372b731bda1106cad6"
+        },
+        "date": 1789147417999,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "Pingpong - Direct",
+            "value": 229.8038674,
+            "unit": "ms"
+          },
+          {
+            "name": "Pingpong - Polling-2-200-1",
+            "value": 924.0263116,
+            "unit": "ms"
+          },
+          {
+            "name": "Pingpong - Signaling-2-200-1",
+            "value": 280.535378,
+            "unit": "ms"
+          },
+          {
+            "name": "Pingpong - WorkStealing-2-200-1",
+            "value": 220.3543564,
             "unit": "ms"
           }
         ]
