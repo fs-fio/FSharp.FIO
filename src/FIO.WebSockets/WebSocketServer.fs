@@ -40,17 +40,19 @@ module WebSocketServer =
     let startDefault (url: string) =
         start url
 
-    /// Stops a listener, gracefully completing in-flight requests.
+    /// Stops a listener, gracefully completing in-flight requests, suppressing errors.
     let close (listener: HttpListener) =
-        FIO.attempt
+        (FIO.attempt
             (fun () -> listener.Stop())
             WsError.fromException
+        ).CatchAll(logAndSuppress "websocket listener close")
 
-    /// Aborts a listener immediately, dropping in-flight requests.
+    /// Aborts a listener immediately, dropping in-flight requests, suppressing errors.
     let abort (listener: HttpListener) =
-        FIO.attempt
+        (FIO.attempt
             (fun () -> listener.Abort())
             WsError.fromException
+        ).CatchAll(logAndSuppress "websocket listener abort")
 
     let private tryAccept (listener: HttpListener) (config: WebSocketConfig) (subProtocol: string option) =
         fio {
