@@ -10,15 +10,21 @@ open System.Collections.Generic
 
 module private PollingTuning =
     let BatchSize = 256
+
     let PendingQueueCapacityMultiplier = 2
+
     let ChannelSpinWaitIterations = 256
+
     let ChannelSpinMissThreshold = 4_096
+
     let ChannelYieldMissThreshold = 65_536
+
     let FiberSpinWaitIterations = 128
+
     let FiberSpinMissThreshold = 512
+
     let FiberColdMissThreshold = 65_536
-    // The coldest tier sleeps instead of spinning. Reached only after tens of thousands of consecutive
-    // misses on the same entry, so it costs nothing on workloads that block and unblock normally.
+
     let ColdSleepMilliseconds = 1
 
 [<Struct>]
@@ -87,7 +93,6 @@ and private EvaluationWorker(config: EvaluationWorkerConfig, workerId: int) =
             cancelSource.Dispose()
 
 and internal BlockingWorker(config: BlockingWorkerConfig, workerId: int) =
-
     let batchSize = PollingTuning.BatchSize
 
     let pendingQueueCapacity =
@@ -144,9 +149,6 @@ and internal BlockingWorker(config: BlockingWorkerConfig, workerId: int) =
                 do! addVt.AsTask()
         }
 
-    // Backoff is tiered by how long an entry has gone unready: spin while a wake-up is plausibly
-    // imminent, then yield, then sleep. The sleeping tier is what stops a fiber blocked on something
-    // that never arrives from holding this worker at 100% CPU indefinitely.
     let applyBackoff (maxChannelMiss: int, maxFiberMiss: int, minFiberMiss: int) (cancelToken: CancellationToken) =
         task {
             if maxChannelMiss > 0 then

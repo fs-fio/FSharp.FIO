@@ -36,14 +36,23 @@ let private ContStackMaxDepth = 4096
 let private WorkItemMaxPool = 512
 
 type internal Scheduler(workerCount: int) =
+
     let globalQueue = MailboxQueue<WorkItem>()
+
     let runNext: WorkItem[] = Array.zeroCreate workerCount
+
     let deques: WorkStealingDeque[] = Array.init workerCount (fun _ -> WorkStealingDeque(DequeCapacity))
+
     let tick: int[] = Array.zeroCreate workerCount
+
     let contStackPools: Stack<Stack<Cont>>[] = Array.init workerCount (fun _ -> Stack<Stack<Cont>>())
+
     let workItemPools: Stack<WorkItem>[] = Array.init workerCount (fun _ -> Stack<WorkItem>())
+
     let workGate = new SemaphoreSlim(0)
+
     let mutable waitingWorkers = 0
+
     let mutable numSearching = 0
 
     let hasAnyWorkApprox () =
@@ -197,7 +206,9 @@ and [<Struct>] private CompletionAction =
 and private Worker(config: EvaluationWorkerConfig) =
 
     let scheduler = config.Scheduler
+
     let runtime = config.Runtime
+
     let workerId = config.WorkerId
 
     let struct (cancelSource, _workerTask) =
@@ -234,8 +245,6 @@ and private Worker(config: EvaluationWorkerConfig) =
                         else
                             scheduler.EndSearch()
 
-                    // Completed (success/failure) fibers have nothing left to run, but an interrupted
-                    // fiber may still need to unwind finalizers, so it must not be gated out here.
                     if hasWork && not (workItem.FiberContext.IsCompleted()) then
                         let fiberContext = workItem.FiberContext
                         try
@@ -271,13 +280,13 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
 
     let workers =
         List.init workerCount (fun i ->
-            new Worker(
+            new Worker
                 {
                     Scheduler = scheduler
                     Runtime = this
                     WorkerId = i
                     EvaluationSteps = config.EvaluationSteps
-                }))
+                })
 
     override _.Name =
         "WorkStealingRuntime"
@@ -344,16 +353,6 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                 let writeTask = channel.WriteAsync message
                                 if not writeTask.IsCompletedSuccessfully then
                                     do! writeTask
-                                // Wake a reader parked in HandleReadChan. The two sites form a Dekker handshake across
-                                // two channels (here: store the value, then load the blocking-count; there: store the
-                                // waiter, then load the value-count). On a weak memory model that store->load pair can
-                                // reorder, leaving a theoretical lost-wakeup window. It is deliberately left unfenced:
-                                // both publishes go through System.Threading.Channels' internal lock and the reader
-                                // double-checks, so the window is vanishingly small and did NOT reproduce in ~240M
-                                // park-heavy handoffs on ARM (the harness that reproduced the Signaling variant 100/100).
-                                // A full memory fence would close it but is rejected; channel-native WaitToReadAsync
-                                // parking also closes it but regresses WS message-passing ~2x (woken readers lose
-                                // worker-local scheduling -> global queue). Kept inline for throughput.
                                 if channel.BlockingWorkItemCount > 0 then
                                     let mutable blockedReader = Unchecked.defaultof<WorkItem>
                                     if channel.TryDequeueBlockingWorkItem &blockedReader then
@@ -379,10 +378,6 @@ and WorkStealingRuntime(config: WorkerConfig) as this =
                                             scheduler.GlobalQueue.WriteAsync wi |> ignore
                                             scheduler.SignalWork())
                                     do! channel.AddBlockingWorkItem waiter
-                                    // Reader half of the Dekker handshake in HandleWriteChan: after publishing the
-                                    // waiter, re-check for a message that may have arrived during the park and self-rescue.
-                                    // The unfenced StoreLoad window between this store and load is deliberately accepted
-                                    // there.
                                     if channel.Count > 0 then
                                         let mutable blockedReader = Unchecked.defaultof<WorkItem>
                                         if channel.TryDequeueBlockingWorkItem &blockedReader then
