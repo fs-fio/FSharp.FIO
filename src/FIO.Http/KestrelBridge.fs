@@ -30,6 +30,62 @@ module KestrelBridge =
             || segment.Contains '\\'
         )
 
+    let private readBodyAsync (body: Stream) (maxBodySize: int64) (declaredLength: int option) =
+        task {
+            let bufferSize =
+                match declaredLength with
+                | Some length -> min length 81920
+                | None -> 8192
+
+            let buffer = ArrayPool<byte>.Shared.Rent bufferSize
+            use stream = new MemoryStream()
+
+            try
+                let mutable totalRead = 0L
+                let mutable reading = true
+                let mutable failure = None
+
+                while reading do
+                    let toRead =
+                        match declaredLength with
+                        | Some length -> min bufferSize (length - int totalRead)
+                        | None -> bufferSize
+
+                    if toRead <= 0 then
+                        reading <- false
+                    else
+                        let! bytesRead = body.ReadAsync(buffer, 0, toRead)
+
+                        if bytesRead = 0 then
+                            reading <- false
+
+                            match declaredLength with
+                            | Some length when totalRead < int64 length ->
+                                failure <-
+                                    Some(
+                                        400,
+                                        $"Request body truncated: received {totalRead} of {length} declared bytes")
+                            | _ -> ()
+                        else
+                            totalRead <- totalRead + int64 bytesRead
+
+                            if totalRead > maxBodySize then
+                                failure <-
+                                    Some(
+                                        413,
+                                        $"Request body size ({totalRead} bytes) exceeds maximum allowed size ({maxBodySize} bytes)")
+                                reading <- false
+                            else
+                                do! stream.WriteAsync(buffer, 0, bytesRead)
+
+                match failure with
+                | Some error -> return Error error
+                | None when totalRead = 0L -> return Ok RequestBody.Empty
+                | None -> return Ok <| RequestBody.Bytes(stream.ToArray())
+            finally
+                ArrayPool<byte>.Shared.Return(buffer, true)
+        }
+
     /// Converts a Kestrel HttpContext into an HttpRequest, enforcing the maximum body size.
     let convertRequestAsync (ctx: HttpContext) (maxBodySize: int64) =
         task {
@@ -80,74 +136,9 @@ module KestrelBridge =
                                             413,
                                             $"Request body size ({contentLength} bytes) exceeds supported buffer size ({Int32.MaxValue} bytes)")
                                 else
-                                    let length = int contentLength
-                                    let buffer = ArrayPool<byte>.Shared.Rent length
-
-                                    try
-                                        let mutable totalRead = 0
-                                        let mutable eof = false
-
-                                        while totalRead < length && not eof do
-                                            let! bytesRead =
-                                                ctx.Request.Body.ReadAsync(buffer, totalRead, length - totalRead)
-
-                                            if bytesRead = 0 then
-                                                eof <- true
-                                            else
-                                                totalRead <- totalRead + bytesRead
-
-                                        if eof && totalRead < length then
-                                            return
-                                                Error(
-                                                    400,
-                                                    $"Request body truncated: received {totalRead} of {length} declared bytes")
-                                        else
-                                            let result = GC.AllocateUninitializedArray<byte> totalRead
-                                            Buffer.BlockCopy(buffer, 0, result, 0, totalRead)
-
-                                            if totalRead = 0 then
-                                                return Ok RequestBody.Empty
-                                            else
-                                                return Ok <| RequestBody.Bytes result
-                                    finally
-                                        ArrayPool<byte>.Shared.Return(buffer)
+                                    return! readBodyAsync ctx.Request.Body maxBodySize (Some(int contentLength))
                             else
-                                let bufferSize = 8192
-                                let buffer = ArrayPool<byte>.Shared.Rent bufferSize
-                                use stream = new MemoryStream()
-
-                                try
-                                    let mutable totalRead = 0L
-                                    let mutable loop = true
-                                    let mutable sizeError = None
-
-                                    while loop do
-                                        let! bytesRead = ctx.Request.Body.ReadAsync(buffer, 0, bufferSize)
-
-                                        if bytesRead = 0 then
-                                            loop <- false
-                                        else
-                                            totalRead <- totalRead + int64 bytesRead
-
-                                            if totalRead > maxBodySize then
-                                                sizeError <-
-                                                    Some(
-                                                        413,
-                                                        $"Request body size ({totalRead} bytes) exceeds maximum allowed size ({maxBodySize} bytes)")
-
-                                                loop <- false
-                                            else
-                                                do! stream.WriteAsync(buffer, 0, bytesRead)
-
-                                    match sizeError with
-                                    | Some error -> return Error error
-                                    | None ->
-                                        if totalRead = 0L then
-                                            return Ok RequestBody.Empty
-                                        else
-                                            return Ok <| RequestBody.Bytes(stream.ToArray())
-                                finally
-                                    ArrayPool<byte>.Shared.Return(buffer)
+                                return! readBodyAsync ctx.Request.Body maxBodySize None
                         }
 
                     match bodyResult with

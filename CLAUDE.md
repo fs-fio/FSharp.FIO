@@ -9,9 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 FIO is a type-safe, purely functional effect system for F#. IO monad + fibers (green threads) for concurrent/async apps.
 
-**Target:** .NET 10, F# 10, `.slnx` solution format (`FIO.slnx`). SDK pinned to `10.0.301` via `global.json` (`rollForward: latestMinor`).
+**Target:** .NET 10, F# 10, `.slnx` solution format (`FIO.slnx`). SDK pinned to `10.0.400` via `global.json` (`rollForward: latestMinor`).
 
-Repository: <https://github.com/fs-fio/fio> · License: MIT · Baseline version: `0.2.2-beta` (single source of truth in `Directory.Build.props`).
+Repository: <https://github.com/fs-fio/fio> · License: MIT · Baseline version: `0.3.0-beta` (single source of truth in `Directory.Build.props`).
 
 ## Build Commands
 
@@ -138,7 +138,7 @@ Worker config fields: **EvaluationWorkers** (worker count), **EvaluationSteps** 
 - **Cont** - Continuation types: `SuccessCont`/`FailureCont`/`FinalizerCont`/`PostFinalizerCont`. `FinalizerCont` ensures finalizers run on interruption, not just success/error; `PostFinalizerCont` restores the saved outcome after a finalizer completes.
 - **ContStack** / **ContStackPool** - Continuation stacks, pooled per-thread to reduce GC
 - **WorkItemPool** - Thread-local pool for WorkItems to reduce GC pressure
-- **InterruptionCause** - `ParentInterrupted` | `ExplicitInterrupt` | `InvalidArgument` | `ResourceExhaustion`
+- **InterruptionCause** - `ParentInterrupted` | `ExplicitInterrupt` | `InvalidArgument` | `ResourceExhaustion` | `Defect` (user code threw where no typed error could be produced)
 
 ### Concurrency Primitives
 
@@ -222,8 +222,10 @@ Macro benchmarks live in `benchmarks/FIO.Benchmarks/` (BenchmarkDotNet 0.15.8). 
 
 ## Testing
 
-- **Expecto + FsCheck** for property-based testing; test runner config: `Parallel`, `Summary`, `Colours 256`. Pinned versions (`Directory.Packages.props`): Expecto 10.2.3, FsCheck 2.16.6.
-- Custom FsCheck `Generators` type in `tests/FIO.Tests/Utils/Utilities.fs` provides `Arb` for all four runtimes — tests run against `DirectRuntime`, `PollingRuntime`, `SignalingRuntime`, and `WorkStealingRuntime`
+- **Expecto + FsCheck** for property-based testing; test runner config: `Parallel`, `Summary`, `Colours 256`. Pinned versions (`Directory.Packages.props`): Expecto 11.1.0, FsCheck 3.4.0.
+- `tests/FIO.Tests/Utils/Utilities.fs` is the single source of runtime test helpers: `allRuntimes()`, `testAllRuntimes`, `testAllRuntimesSequenced` (for `System.Console`'s process-global state), and the FsCheck `Generators` `Arb`. All of them cover **all four** runtimes — `DirectRuntime`, `PollingRuntime`, `SignalingRuntime`, `WorkStealingRuntime`. Do not redefine these per test file: a helper named "all runtimes" that quietly omits one is how a runtime-specific defect survives a green suite
+- They share one `testConfig` (`EvaluationWorkers = 2`), not `WorkerConfig.Default`. `allRuntimes()` is called once per test list and the runtimes are never disposed, so the default (`ProcessorCount - 2`) would spawn thousands of threads and make wall-clock deadline assertions flake under load. Stress tests build their own runtimes with an explicit config
+- `tests/FIO.Tests/Runtime/ConformanceTests.fs` asserts the four runtimes are observationally equivalent — defect paths, typed-error integrity, `Await`/`UnsafeResult` agreement, `RunConcurrent`. It deliberately uses `'E = string`, because `Fiber.Task()` casts the error channel with `error :?> 'E`: a non-`'E` value there raises `InvalidCastException`, which `'E = exn` silently absorbs
 - Heavy stress/regression tests (deadlock & lost-wakeup guards) are **opt-in** via the `FIO_RUN_STRESS=1` env var (`stressEnabled`/`stressTestCase` in `tests/FIO.Tests/Utils/Utilities.fs`) — off by default locally, enabled in CI
 - Console tests use `System.Console.SetOut`/`SetIn` with `StringWriter`/`StringReader` for deterministic capture — must use `testSequenced` (not parallel) because `System.Console` has process-global state
 - Four test projects:
@@ -234,7 +236,7 @@ Macro benchmarks live in `benchmarks/FIO.Benchmarks/` (BenchmarkDotNet 0.15.8). 
 - Core tests use `Generators` type for FsCheck Arb across all 4 runtimes; extension tests use `testAllRuntimes` helper wrapping `testSequenced`
 - `InternalsVisibleTo("FIO.Tests")` is set on the core project only (extension libs do not expose internals to tests)
 - All WebSocket test files are enabled in the `.fsproj` (including `WebSocketServerTests.fs`); the suite passes (no hang)
-- Stack-safety canaries live in `tests/FIO.Tests/DSL/FIOTests.fs` — the three "Stack safety - deep left-chained FlatMap/CatchAll/Ensuring" tests at depth 10000 are load-bearing for the iterative-flattening design of `UpcastResult`/`UpcastError`/`UpcastBoth`. Do not "simplify" those methods to plain recursion.
+- Stack-safety canaries live in `tests/FIO.Tests/DSL/FIOTests.fs` — the four "Stack safety - deep left-chained FlatMap/CatchAll/Ensuring/MapBoth" tests at depth 10000 are load-bearing for the iterative-flattening design of `UpcastResult`/`UpcastError`/`UpcastBoth`. Do not "simplify" those methods to plain recursion.
 
 ## Semantic Invariants (Do Not Break)
 
@@ -243,16 +245,43 @@ Macro benchmarks live in `benchmarks/FIO.Benchmarks/` (BenchmarkDotNet 0.15.8). 
 - **Parallel operators**: `<&>`, `&>`, `<&`, `<&&>` must be genuinely concurrent in fiber runtimes
 - **Interruption semantics**: interruption must propagate through fibers consistently across all runtimes
 - **Fail-fast parallelism**: the parallel combinators (`ZipPar`/`Race` family, `forEachPar`) settle on the first relevant completion and interrupt losers/peers — they must never hang on a stuck sibling
-- **Finalizer guarantee**: `Ensuring` finalizers run on all three outcomes — success, error, and interruption
-- **Error typing**: extensions must not leak raw exceptions as public errors
+- **Finalizer guarantee**: `Ensuring` finalizers run on all three outcomes — success, error, and
+  interruption. There is no fourth outcome: a fiber may never be discarded without unwinding. In
+  particular a runtime must not drop queued work items to "reset" itself
+- **Fork is scope-attached** (ZIO's `fork`, not its `forkDaemon`): when a fiber finishes it interrupts
+  every fiber it forked, and **does not publish its own result until they have unwound** — so once you
+  observe a fiber's result, every finalizer in its subtree has already run. `ForkDaemon` opts out: a
+  daemon fiber is neither interrupted nor awaited, and its lifetime becomes the caller's to manage.
+  Consequence for API design: to observe a forked child's result you must await it *inside* the parent,
+  or the parent finishing will interrupt it first
+- **Scope completion must never block a scheduler thread.** The parent/child rendezvous is the latch in
+  `FiberContext` (`completing`/`outstanding`/`published`, settled by `TryFinish`), modelled on
+  `JoinAllLatch`. An earlier attempt awaited children inside `Complete` and deadlocked: the await
+  occupied a worker, and with few workers no thread was left to run the children being waited for
+- **Suppression means uncancellable.** While `InterruptionSuppressed > 0` (an `Ensuring` finalizer),
+  the fiber is uninterruptible, so `FIO.cancellationToken()` yields `CancellationToken.None` and
+  `awaitedTask` skips `WaitAsync`. Both follow the same rule, and it is what lets a finalizer `sleep`,
+  `async` or `awaitAsync` after its fiber was interrupted — handing out the already-cancelled token
+  made `Task.Delay` fault instantly and `Register` fire immediately, truncating cleanup
+- **Interrupted fibers publish immediately.** A fiber that is *interrupted* surfaces its result at once
+  while its subtree unwinds behind it; only a fiber that *completes* holds its result back. Children are
+  interrupted on both paths, so no finalizer is skipped either way — only the ordering differs
+- **Error typing**: extensions must not leak raw exceptions as public errors. Nothing may place a
+  non-`'E` value in the error channel: when user code throws where no `'E` can be produced (a `Suspend`
+  thunk, a `FlatMap`/`CatchAll` continuation, a throwing `onError`), the fiber dies with
+  `InterruptionCause.Defect`, and joining an interrupted fiber propagates interruption rather than a
+  typed failure
 
 ## Architecture Change Checklist
 
 - **New effect constructor**: update `Core.fs` (FIO DU + `UpcastResult`/`UpcastError`/`UpcastBoth`), `Factories.fs`, `Extensions.fs`, `Operators.fs`, and `CE.fs` as needed
 - **New shared effect case**: add handling to `handleSharedCase` in `InterpreterCore.fs`
-- **New runtime-specific effect case**: add to `RuntimeCase` DU in `InterpreterCore.fs`, route from `handleSharedCase`, update all four runtime `RuntimeCase` matches
+- **New runtime-specific effect case**: add to `RuntimeCase` DU in `InterpreterCore.fs`, route from `handleSharedCase`, then handle it in each runtime's `RuntimeCase` match. Before writing it out per runtime, check whether it fits an existing shared helper — `awaitedTask` (how to wait, given interruption suppression), `settledTaskEffect` (settled task → resume effect), `parkOnTask` (park on an unfinished task; the reschedule seam is the only per-runtime part), `resumeWith` (carry suspension state onto a rented work item). Only the scheduling seam should differ between runtimes
 - **New runtime DU case**: update `Core.fs` and all four runtime interpreters (`DirectRuntime.fs`, `PollingRuntime.fs`, `SignalingRuntime.fs`, `WorkStealingRuntime.fs`)
-- **Runtime change**: update interpreter logic, add tests, and validate benchmarks
+- **Runtime change**: update interpreter logic, add tests, and validate benchmarks. A runtime has one
+  entry point, `Run`: schedule the effect on a new fiber and return. It must never wait for, interrupt,
+  or discard fibers already running — clearing scheduler queues destroys in-flight work *without*
+  running finalizers, which `tests/FIO.Tests/Runtime/ConformanceTests.fs` guards against
 - **Extension change**: update error model, DSL surface, and extension README
 - **Behavior change**: update examples and tests to match new semantics
 - **New public API**: add a concise XML doc comment per [`docs/COMMENT_STYLE.md`](docs/COMMENT_STYLE.md)
@@ -261,9 +290,9 @@ Macro benchmarks live in `benchmarks/FIO.Benchmarks/` (BenchmarkDotNet 0.15.8). 
 
 Three GitHub Actions workflows in `.github/workflows/`:
 
-- **`test.yml` (Run Tests)** — push/PR on **all branches** + manual. Matrix: Ubuntu, Windows, macOS (`fail-fast: false`). Sets `FIO_RUN_STRESS=1` to enable the opt-in stress/regression tests. Restores tools + deps, builds `./FIO.slnx`. Non-Ubuntu runs tests; Ubuntu runs tests with `XPlat Code Coverage` and uploads to **Codecov**.
-- **`benchmark.yml` (Performance Benchmarks)** — push/PR to **main** + manual, Ubuntu only. First a **smoke test** (all benchmarks × all 4 runtimes — Direct, Polling, Signaling, WorkStealing — tiny params, `--job Dry`, 10-min timeout) to fail fast on hang/throw; then a measured **Pingpong** run across those runtimes, exported as JSON/GitHub-markdown and tracked over time via `github-action-benchmark` (`customSmallerIsBetter`, alerts on regression). It does not generate plots — plotting is a local step.
-- **`publish.yml` (Publish NuGet Packages)** — on tags. `v*` = **lockstep** (all four packages; tag must equal `Directory.Build.props` `<Version>`); `core-v*`/`http-v*`/`sockets-v*`/`websockets-v*` = **per-package** release (sets `PackageReleaseVersion`, leaving the FIO dependency pinned to the baseline). Builds Release, runs tests, packs, pushes to NuGet.org, and creates a GitHub release.
+- **`test.yml` (Run Tests)** — push/PR on **`main`** + manual. Matrix: Ubuntu, Windows, macOS (`fail-fast: false`), one identical test step per OS. Sets `FIO_RUN_STRESS=1` to enable the opt-in stress/regression tests, bounded by `timeout-minutes: 30` because a deadlock is a plausible failure mode here. Writes a TRX per OS and uploads it `if: always()` — a CI-only flake cannot be re-run with better capture. **No coverage collection:** Codecov was wired up but never received a single upload (`activated: false`, 0 commits), so it was removed rather than left to pay 3–5× instrumentation cost on every Ubuntu run for nothing. Coverage is a local `dotnet test --collect:"XPlat Code Coverage"` measurement.
+- **`benchmark.yml` (Performance Benchmarks)** — push/PR to **main** (skipping docs-only changes) + manual, Ubuntu only. First a **smoke test** (all benchmarks × all 4 runtimes — Direct, Polling, Signaling, WorkStealing — tiny params, `--job Dry`, 10-min timeout) to fail fast on hang/throw; then a measured **Pingpong** run across those runtimes, exported as JSON/GitHub-markdown and published to <https://fs-fio.github.io/fio/dev/bench/> via `github-action-benchmark` (`customSmallerIsBetter`, auto-pushed to the `gh-pages` branch on `main` only). That dashboard is a **tracker, not a gate** — shared-runner variance swamps any useful threshold, so `fail-on-alert` is off and the real perf gate is the local sentinel-bracketed A/B protocol. The series names embed the runtime spec (`Pingpong - WorkStealing-2-200-1`), so changing a spec starts a new series and orphans the history. It does not generate plots — plotting is a local step.
+- **`publish.yml` (Publish NuGet Packages)** — on tags. `v*` = **lockstep** (all four packages; tag must equal `Directory.Build.props` `<Version>`); `core-v*`/`http-v*`/`sockets-v*`/`websockets-v*` = **per-package** release (sets `PackageReleaseVersion`, leaving the FIO dependency pinned to the baseline). Builds Release, runs tests, packs, pushes to NuGet.org, and creates a GitHub release. The NuGet push is gated on `refs/tags/`, so a `workflow_dispatch` run is a dry run: it builds, tests, packs and uploads the artifact without publishing.
 
 ## Commit Style
 
@@ -283,7 +312,7 @@ Keep doc comments well-formed XML: rephrase types out of prose ("an effect") or 
 - **`.editorconfig`** governs formatting: UTF-8, LF line endings, final newline, trim trailing whitespace (except `*.md`). 4-space indent for F# (`*.fs/fsi/fsx`) and project files (`*.fsproj/props/targets/slnx`); 2-space for JSON/YAML.
 - **`TreatWarningsAsErrors=true`** — set once in `Directory.Build.props`, applies to every project. Fix all warnings. Use `TreatWarningsAsErrors`, **not** `WarningsAsErrors` (the F# SDK reads the latter as a warning-number list).
 - **XML docs:** packable libraries set `GenerateDocumentationFile=true` and `WarnOn 3390`, so malformed doc XML fails the build.
-- **Central Package Management:** all package versions are pinned in `Directory.Packages.props` (e.g. FSharp.Core 10.1.301, BenchmarkDotNet 0.15.8). FSharp.Core's implicit reference is disabled in favor of an explicit, version-less `PackageReference` so the central version wins.
+- **Central Package Management:** all package versions are pinned in `Directory.Packages.props` (e.g. FSharp.Core 10.1.401, BenchmarkDotNet 0.15.8). FSharp.Core's implicit reference is disabled in favor of an explicit, version-less `PackageReference` so the central version wins.
 - **Versioning:** the baseline `<Version>` lives once in `Directory.Build.props`; the publish workflow overrides it from the git tag. Only the four `src/` libraries are packable (`IsPackable`); tests/benchmarks/examples are not.
 
 ## Important Notes

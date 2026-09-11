@@ -8,7 +8,10 @@ open FIO.Runtime
 open FIO.Runtime.Default
 open FIO.Http.SimpleRoutes
 
+open System
 open System.Text
+open System.Net.Http
+open System.Net.Sockets
 
 open Expecto
 
@@ -18,109 +21,317 @@ let serverTests =
         testList
             "Server"
             [
-                // ─── Routing ─────────────────────────────────────────
+                testList
+                    "Routing"
+                    [
+                        testCase "starts and responds to GET request"
+                        <| fun () ->
+                            let routes = get "/" (HttpHandler.text "hello")
 
-                testCase "starts and responds to GET request"
-                <| fun () ->
-                    let routes = get "/" (HttpHandler.text "hello")
+                            withTestHttpServer routes (fun port ->
+                                use client = new HttpClient()
 
-                    withTestHttpServer routes (fun port ->
-                        use client = new System.Net.Http.HttpClient()
+                                let resp = client.GetAsync($"http://127.0.0.1:{port}/").Result
+                                Expect.equal (int resp.StatusCode) 200 "200"
 
-                        let resp = client.GetAsync($"http://127.0.0.1:{port}/").Result
-                        Expect.equal (int resp.StatusCode) 200 "200"
+                                let body = resp.Content.ReadAsStringAsync().Result
+                                Expect.equal body "hello" "Body")
 
-                        let body = resp.Content.ReadAsStringAsync().Result
-                        Expect.equal body "hello" "Body")
+                        testCase "routes to correct handler"
+                        <| fun () ->
+                            let routes =
+                                get "/a" (HttpHandler.text "A")
+                                |> Routes.combine (get "/b" (HttpHandler.text "B"))
 
-                testCase "routes to correct handler"
-                <| fun () ->
-                    let routes =
-                        get "/a" (HttpHandler.text "A")
-                        |> Routes.combine (get "/b" (HttpHandler.text "B"))
+                            withTestHttpServer routes (fun port ->
+                                use client = new HttpClient()
 
-                    withTestHttpServer routes (fun port ->
-                        use client = new System.Net.Http.HttpClient()
+                                let bodyA = client.GetStringAsync($"http://127.0.0.1:{port}/a").Result
+                                let bodyB = client.GetStringAsync($"http://127.0.0.1:{port}/b").Result
 
-                        let bodyA = client.GetStringAsync($"http://127.0.0.1:{port}/a").Result
-                        let bodyB = client.GetStringAsync($"http://127.0.0.1:{port}/b").Result
+                                Expect.equal bodyA "A" "Route A"
+                                Expect.equal bodyB "B" "Route B")
 
-                        Expect.equal bodyA "A" "Route A"
-                        Expect.equal bodyB "B" "Route B")
+                        testCase "returns 404 for unknown path"
+                        <| fun () ->
+                            let routes = get "/known" (HttpHandler.text "known")
 
-                testCase "returns 404 for unknown path"
-                <| fun () ->
-                    let routes = get "/known" (HttpHandler.text "known")
+                            withTestHttpServer routes (fun port ->
+                                use client = new HttpClient()
 
-                    withTestHttpServer routes (fun port ->
-                        use client = new System.Net.Http.HttpClient()
+                                let resp = client.GetAsync($"http://127.0.0.1:{port}/unknown").Result
 
-                        let resp = client.GetAsync($"http://127.0.0.1:{port}/unknown").Result
+                                Expect.equal (int resp.StatusCode) 404 "404")
+                    ]
 
-                        Expect.equal (int resp.StatusCode) 404 "404")
+                testList
+                    "Body handling"
+                    [
+                        testCase "handles JSON response body"
+                        <| fun () ->
+                            let routes = get "/json" (HttpHandler.okJson {| message = "hello" |})
 
-                // ─── Body handling ─────────────────────────────────────────
+                            withTestHttpServer routes (fun port ->
+                                use client = new HttpClient()
+                                let resp = client.GetAsync($"http://127.0.0.1:{port}/json").Result
+                                Expect.equal (int resp.StatusCode) 200 "200"
 
-                testCase "handles JSON response body"
-                <| fun () ->
-                    let routes = get "/json" (HttpHandler.okJson {| message = "hello" |})
+                                let ct = resp.Content.Headers.ContentType.ToString()
+                                Expect.stringContains ct "application/json" "JSON content-type"
 
-                    withTestHttpServer routes (fun port ->
-                        use client = new System.Net.Http.HttpClient()
-                        let resp = client.GetAsync($"http://127.0.0.1:{port}/json").Result
-                        Expect.equal (int resp.StatusCode) 200 "200"
+                                let body = resp.Content.ReadAsStringAsync().Result
+                                Expect.stringContains body "hello" "JSON body")
 
-                        let ct = resp.Content.Headers.ContentType.ToString()
-                        Expect.stringContains ct "application/json" "JSON content-type"
+                        testCase "handles POST with request body"
+                        <| fun () ->
+                            let routes =
+                                post "/echo" (fun req -> FIO.succeed (Response.okText (req.Body.AsString())))
 
-                        let body = resp.Content.ReadAsStringAsync().Result
-                        Expect.stringContains body "hello" "JSON body")
+                            withTestHttpServer routes (fun port ->
+                                use client = new HttpClient()
 
-                testCase "handles POST with request body"
-                <| fun () ->
-                    let routes =
-                        post "/echo" (fun req -> FIO.succeed (Response.okText (req.Body.AsString())))
+                                let content =
+                                    new StringContent("test payload", Encoding.UTF8, "text/plain")
 
-                    withTestHttpServer routes (fun port ->
-                        use client = new System.Net.Http.HttpClient()
+                                let resp = client.PostAsync($"http://127.0.0.1:{port}/echo", content).Result
+                                Expect.equal (int resp.StatusCode) 200 "200"
 
-                        let content =
-                            new System.Net.Http.StringContent("test payload", Encoding.UTF8, "text/plain")
+                                let body = resp.Content.ReadAsStringAsync().Result
+                                Expect.equal body "test payload" "Echoed body")
 
-                        let resp = client.PostAsync($"http://127.0.0.1:{port}/echo", content).Result
-                        Expect.equal (int resp.StatusCode) 200 "200"
+                        testCase "handles text response body"
+                        <| fun () ->
+                            let routes = get "/text" (HttpHandler.text "plain text")
 
-                        let body = resp.Content.ReadAsStringAsync().Result
-                        Expect.equal body "test payload" "Echoed body")
+                            withTestHttpServer routes (fun port ->
+                                use client = new HttpClient()
 
-                testCase "handles text response body"
-                <| fun () ->
-                    let routes = get "/text" (HttpHandler.text "plain text")
+                                let body = client.GetStringAsync($"http://127.0.0.1:{port}/text").Result
+                                Expect.equal body "plain text" "Text body")
+                    ]
 
-                    withTestHttpServer routes (fun port ->
-                        use client = new System.Net.Http.HttpClient()
+                testList
+                    "Request body limits and rejection paths"
+                    [
+                        testCase "rejects a body larger than the limit with 413"
+                        <| fun () ->
+                            let routes =
+                                post "/upload" (fun req -> FIO.succeed (Response.okText (req.Body.AsString())))
 
-                        let body = client.GetStringAsync($"http://127.0.0.1:{port}/text").Result
-                        Expect.equal body "plain text" "Text body")
+                            withTestHttpServerMaxBody 64L routes (fun port ->
+                                use client = new HttpClient()
 
-                // ─── Server lifecycle ─────────────────────────────────────────
+                                let content =
+                                    new StringContent(String.replicate 500 "x", Encoding.UTF8, "text/plain")
 
-                testCase "startServer serves a request then stop tears down"
-                <| fun () ->
-                    let port = findAvailablePort ()
-                    let config = ServerConfig.create "127.0.0.1" port
-                    let routes = get "/ping" (HttpHandler.text "pong")
-                    use runtime = new DefaultRuntime()
+                                let resp = client.PostAsync($"http://127.0.0.1:{port}/upload", content).Result
 
-                    let server =
-                        runWithTimeout (runtime :> FIORuntime) (Server.startServer config routes)
+                                Expect.equal (int resp.StatusCode) 413 "An over-sized body must be rejected with 413"
 
-                    try
-                        System.Threading.Thread.Sleep 200
-                        use client = new System.Net.Http.HttpClient()
-                        let body = client.GetStringAsync($"http://127.0.0.1:{port}/ping").Result
-                        Expect.equal body "pong" "Served via Server.startServer"
-                    finally
-                        runWithTimeout (runtime :> FIORuntime) (Server.stop server) |> ignore
+                                let body = resp.Content.ReadAsStringAsync().Result
+                                Expect.stringContains body "exceeds maximum allowed size" "The 413 must say why")
+
+                        testCase "accepts a body exactly at the limit"
+                        <| fun () ->
+                            let payload = String.replicate 64 "y"
+                            let routes =
+                                post "/upload" (fun req -> FIO.succeed (Response.okText (req.Body.AsString())))
+
+                            withTestHttpServerMaxBody 64L routes (fun port ->
+                                use client = new HttpClient()
+
+                                let content =
+                                    new StringContent(payload, Encoding.UTF8, "text/plain")
+
+                                let resp = client.PostAsync($"http://127.0.0.1:{port}/upload", content).Result
+
+                                Expect.equal (int resp.StatusCode) 200 "A body exactly at the limit is allowed"
+                                Expect.equal (resp.Content.ReadAsStringAsync().Result) payload "Body must round-trip intact")
+
+                        testCase "survives a truncated request body and keeps serving"
+                        <| fun () ->
+                            let routes = get "/ping" (HttpHandler.text "pong")
+
+                            withTestHttpServer routes (fun port ->
+                                use tcp = new TcpClient()
+                                tcp.Connect("127.0.0.1", port)
+                                use stream = tcp.GetStream()
+
+                                let request =
+                                    String.concat "\r\n" [
+                                        "POST /upload HTTP/1.1"
+                                        "Host: 127.0.0.1"
+                                        "Content-Type: text/plain"
+                                        "Content-Length: 100"
+                                        "Connection: close"
+                                        ""
+                                        "short" ]
+
+                                let bytes = Encoding.ASCII.GetBytes request
+                                stream.Write(bytes, 0, bytes.Length)
+                                stream.Flush()
+                                tcp.Client.Shutdown SocketShutdown.Send
+                                stream.ReadTimeout <- 5000
+                                (try stream.ReadByte() |> ignore with _ -> ())
+
+                                // The real assertion: the server is still healthy afterwards.
+                                use client = new HttpClient()
+                                let body = client.GetStringAsync($"http://127.0.0.1:{port}/ping").Result
+                                Expect.equal body "pong" "A truncated request must not wedge the server")
+                    ]
+
+                testList
+                    "Response writing"
+                    [
+                        testCase "HEAD suppresses the body but keeps Content-Length"
+                        <| fun () ->
+                            let routes = get "/text" (HttpHandler.text "plain text")
+
+                            withTestHttpServer routes (fun port ->
+                                use tcp = new TcpClient()
+                                tcp.Connect("127.0.0.1", port)
+                                use stream = tcp.GetStream()
+
+                                let request =
+                                    String.concat "\r\n" [
+                                        "HEAD /text HTTP/1.1"
+                                        "Host: 127.0.0.1"
+                                        "Connection: close"
+                                        ""
+                                        "" ]
+
+                                let bytes = Encoding.ASCII.GetBytes request
+                                stream.Write(bytes, 0, bytes.Length)
+                                stream.Flush()
+
+                                stream.ReadTimeout <- 5000
+                                use reader = new IO.StreamReader(stream, Encoding.ASCII)
+                                let raw = try reader.ReadToEnd() with _ -> ""
+
+                                Expect.stringContains raw "200" "HEAD must still succeed"
+                                Expect.stringContains raw "Content-Length: 10" "HEAD must report the length a GET would return"
+
+                                let idx = raw.IndexOf "\r\n\r\n"
+                                let body = if idx >= 0 then raw.Substring(idx + 4) else ""
+                                Expect.equal body "" "HEAD must not write a response body")
+
+                        testCase "serves a raw byte response body"
+                        <| fun () ->
+                            let payload = [| 0uy; 1uy; 2uy; 253uy; 254uy; 255uy |]
+
+                            let routes =
+                                get "/bytes" (fun _ ->
+                                    FIO.succeed
+                                        { HttpResponse.create HttpStatusCode.OK with
+                                            Body = ResponseBody.Bytes payload })
+
+                            withTestHttpServer routes (fun port ->
+                                use client = new HttpClient()
+                                let resp = client.GetAsync($"http://127.0.0.1:{port}/bytes").Result
+
+                                Expect.equal (int resp.StatusCode) 200 "200"
+                                Expect.sequenceEqual
+                                    (resp.Content.ReadAsByteArrayAsync().Result)
+                                    payload
+                                    "Raw bytes must round-trip unmodified")
+
+                        testCase "a throwing handler still produces a well-formed response"
+                        <| fun () ->
+                            let routes = get "/boom" (fun _ -> FIO.attempt (fun () -> failwith "handler exploded") id)
+
+                            withTestHttpServer routes (fun port ->
+                                use client = new HttpClient()
+                                let resp = client.GetAsync($"http://127.0.0.1:{port}/boom").Result
+
+                                Expect.isTrue
+                                    (int resp.StatusCode >= 500)
+                                    $"A throwing handler must surface as a server error, got {int resp.StatusCode}")
+
+                        testCase "rejects a path-traversal segment with 400"
+                        <| fun () ->
+                            let routes = get "/safe" (HttpHandler.text "ok")
+
+                            withTestHttpServer routes (fun port ->
+                                use client = new HttpClient()
+                                use request =
+                                    new HttpRequestMessage(
+                                        HttpMethod.Get,
+                                        Uri("http://127.0.0.1:" + string port + "/..%2f..%2fetc/passwd", UriKind.Absolute))
+
+                                let resp = client.SendAsync(request).Result
+
+                                Expect.isTrue
+                                    (int resp.StatusCode = 400 || int resp.StatusCode = 404)
+                                    $"A traversal segment must not be served, got {int resp.StatusCode}")
+                    ]
+
+                testList
+                    "ServerBuilder (shipped public API, previously never executed)"
+                    [
+                        testCase "ServerBuilder setters compose onto a configuration"
+                        <| fun () ->
+                            let config =
+                                ServerConfig.create "127.0.0.1" 1
+                                |> ServerBuilder.host "0.0.0.0"
+                                |> ServerBuilder.port 9999
+                                |> ServerBuilder.maxBodySize 4096L
+
+                            Expect.equal config.Host "0.0.0.0" "host must be applied"
+                            Expect.equal config.Port 9999 "port must be applied"
+                            Expect.equal config.MaxRequestBodySize 4096L "maxBodySize must be applied"
+
+                        testCase "ServerBuilder setters are independent"
+                        <| fun () ->
+                            let baseConfig = ServerConfig.create "127.0.0.1" 8080
+                            let hostOnly = baseConfig |> ServerBuilder.host "example.test"
+
+                            Expect.equal hostOnly.Port baseConfig.Port "host must not disturb the port"
+                            Expect.equal
+                                hostOnly.MaxRequestBodySize
+                                baseConfig.MaxRequestBodySize
+                                "host must not disturb the body limit"
+                            Expect.equal baseConfig.Host "127.0.0.1" "the original config must be unchanged"
+
+                        testCase "ServerBuilder.startNow serves a request and can be stopped"
+                        <| fun () ->
+                            let port = findAvailablePort ()
+                            let routes = get "/built" (HttpHandler.text "from builder")
+                            use runtime = new DefaultRuntime()
+
+                            let config =
+                                ServerConfig.create "127.0.0.1" 1
+                                |> ServerBuilder.host "127.0.0.1"
+                                |> ServerBuilder.port port
+
+                            let server = runWithTimeout (runtime :> FIORuntime) (ServerBuilder.startNow routes config)
+
+                            try
+                                let body = getWhenListening $"http://127.0.0.1:{port}/built"
+                                Expect.equal body "from builder" "ServerBuilder.startNow must serve the routes it was given"
+                            finally
+                                runWithTimeout (runtime :> FIORuntime) (Server.stop server) |> ignore
+                    ]
+
+                testList
+                    "Server lifecycle"
+                    [
+                        testCase "startServer serves a request then stop tears down"
+                        <| fun () ->
+                            let port = findAvailablePort ()
+                            let config = ServerConfig.create "127.0.0.1" port
+                            let routes = get "/ping" (HttpHandler.text "pong")
+                            use runtime = new DefaultRuntime()
+
+                            let server =
+                                runWithTimeout (runtime :> FIORuntime) (Server.startServer config routes)
+
+                            try
+                                System.Threading.Thread.Sleep 200
+                                use client = new HttpClient()
+                                let body = client.GetStringAsync($"http://127.0.0.1:{port}/ping").Result
+                                Expect.equal body "pong" "Served via Server.startServer"
+                            finally
+                                runWithTimeout (runtime :> FIORuntime) (Server.stop server) |> ignore
+                    ]
             ]
     )

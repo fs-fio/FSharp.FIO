@@ -2,10 +2,17 @@ name: Run Tests
 
 on:
   push:
-    branches: ["*"]
+    branches: [main]
   pull_request:
-    branches: ["*"]
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -15,7 +22,8 @@ jobs:
       fail-fast: false
     runs-on: ${{ matrix.os }}
 
-    # Run the heavy opt-in stress/regression tests (deadlock & lost-wakeup guards) in CI.
+    timeout-minutes: 30
+
     env:
       FIO_RUN_STRESS: "1"
 
@@ -24,20 +32,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: "10.0.x"
+          global-json-file: global.json
 
       - name: Cache NuGet packages
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.fsproj') }}
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.fsproj', 'Directory.Packages.props', 'global.json') }}
           restore-keys: |
             ${{ runner.os }}-nuget-
-
-      - name: Restore tools
-        run: dotnet tool restore
 
       - name: Restore dependencies
         run: dotnet restore ./FIO.slnx
@@ -46,16 +51,15 @@ jobs:
         run: dotnet build --no-restore ./FIO.slnx
 
       - name: Run tests
-        if: matrix.os != 'ubuntu-latest'
-        run: dotnet test --no-build --verbosity normal ./FIO.slnx
-      - name: Run tests with coverage
-        if: matrix.os == 'ubuntu-latest'
-        run: dotnet test --no-build --verbosity normal --collect:"XPlat Code Coverage" --results-directory ./coverage ./FIO.slnx
+        run: >
+          dotnet test --no-build --verbosity normal ./FIO.slnx
+          --logger "trx;LogFileName=${{ matrix.os }}.trx"
+          --results-directory ./test-results
 
-      - name: Upload coverage to Codecov
-        if: matrix.os == 'ubuntu-latest'
-        uses: codecov/codecov-action@v4
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          files: ./coverage/**/coverage.cobertura.xml
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+          name: test-results-${{ matrix.os }}
+          path: ./test-results/*.trx
+          if-no-files-found: warn

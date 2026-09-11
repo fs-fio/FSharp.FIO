@@ -65,6 +65,21 @@ see [For AI agents & contributors](#for-ai-agents--contributors).
 When in doubt: if a consumer of the NuGet package can *call it*, document it. If
 they can't, leave it bare.
 
+### Why this one has teeth
+
+A `///` on an internal or private item is not merely off-style — F# emits it into the
+generated `.xml` doc file that ships **inside the NuGet package**, so it surfaces as
+IntelliSense for members no consumer can call. The check is mechanical:
+
+```bash
+# after a Release build — every name listed here is a leak
+grep -o '<member name="[MPTF]:[^("]*' src/FIO/bin/Release/net10.0/FIO.xml \
+  | grep -E "FiberContext|InterpreterCore|WorkItem|ContStack"
+```
+
+Use an inline `//` for these instead: the explanation is usually worth keeping, it is
+only the marker that is wrong.
+
 ---
 
 ## 3. F# XML mechanics

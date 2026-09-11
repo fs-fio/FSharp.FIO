@@ -1,34 +1,18 @@
 module FIO.Tests.JoinFirstTests
 
+open FIO.Tests.Utilities
 open FIO.Tests.Utilities.FsCheckProperties
 
 open FIO.DSL
 open FIO.Runtime
-open FIO.Runtime.Direct
-open FIO.Runtime.Polling
-open FIO.Runtime.Signaling
-open FIO.Runtime.WorkStealing
 
 open Expecto
 
 open System
 
-let private runtimes () =
-    [
-        new DirectRuntime() :> FIORuntime
-        new PollingRuntime() :> FIORuntime
-        new SignalingRuntime() :> FIORuntime
-        new WorkStealingRuntime() :> FIORuntime
-    ]
-
-let private testAllRuntimes name (func: FIORuntime -> unit) =
-    testList name
-        [ for rt in runtimes () ->
-            testCase (rt.GetType().Name) (fun () -> func rt) ]
-
 let private stressTestAllRuntimes name (func: FIORuntime -> unit) =
     testList name
-        [ for rt in runtimes () ->
+        [ for rt in allRuntimes () ->
             stressTestCase (rt.GetType().Name) (fun () -> func rt) ]
 
 [<Tests>]

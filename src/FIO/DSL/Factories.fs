@@ -52,7 +52,9 @@ module FIO =
     let suspend<'A, 'E> (effect: unit -> FIO<'A, 'E>) : FIO<'A, 'E> =
         Suspend effect
 
-    /// Creates an effect that yields the current fiber's cancellation token.
+    /// Creates an effect that yields the current fiber's cancellation token. Inside a region where
+    /// interruption is suppressed — an Ensuring finalizer, for instance — the fiber is uninterruptible
+    /// and this yields an uncancellable token, so cleanup work started there runs to completion.
     let cancellationToken<'E> () : FIO<CancellationToken, 'E> =
         FiberCancellationToken
 
@@ -110,14 +112,9 @@ module FIO =
         cancellationToken().FlatMap <| fun _ ->
             awaitUnitTask (Task.Run(fun () -> ())) onError
 
-    type private NeverEffect<'A, 'E>() =
-        static let channel: Channel<'A> = Channel<'A>()
-        static let effect: FIO<'A, 'E> = channel.Read()
-        static member Effect = effect
-
     /// An effect that never completes.
     let never<'A, 'E> () : FIO<'A, 'E> =
-        NeverEffect<'A, 'E>.Effect
+        suspend <| fun () -> (Channel<'A>()).Read()
 
     let internal joinFirst<'E> (fiberContexts: FiberContext list) : FIO<int, 'E> =
         if List.isEmpty fiberContexts then

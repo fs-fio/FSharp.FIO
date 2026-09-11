@@ -7,13 +7,13 @@ open System
 open System.Threading
 open System.Threading.Tasks
 
-/// A single-threaded runtime that runs effects synchronously, waiting on blocked fibers. Handy for tests and simple programs.
+/// A runtime with no scheduler of its own: every fiber is a .NET task on the thread pool, and a
+/// blocked fiber awaits rather than being rescheduled. The simplest runtime — handy for tests,
+/// simple programs, and as the baseline the other runtimes are measured against.
 type DirectRuntime() =
     inherit FIORuntime()
 
-    let mutable currentFiber: FiberContext option = None
 
-    let runLock = obj ()
 
     override _.Name = "DirectRuntime"
 
@@ -90,26 +90,10 @@ type DirectRuntime() =
                                             &state
                                             onSuccessComplete
                                             onErrorComplete
-                                            (OutcomeInterrupted (FiberInterruptedException(
-                                                currentFiberContext.Id,
-                                                ExplicitInterrupt,
-                                                "Fiber was interrupted while blocked on a channel read."
-                                            )))
-                            | HandleForkEffect(effect, fiber, fiberContext) ->
-                                let registration = setupForkRegistration currentFiberContext fiberContext
-                                Task.Run(fun () ->
-                                    task {
-                                        try
-                                            try
-                                                let! value = this.InterpretAsync effect fiberContext
-                                                fiberContext.Complete value
-                                            with ex ->
-                                                fiberContext.Complete <| Error ex
-                                        finally
-                                            registration.Dispose()
-                                    }
-                                    :> Task)
-                                |> ignore
+                                            (OutcomeInterrupted (interruptionFor currentFiberContext "Fiber was interrupted while blocked on a channel read."))
+                            | HandleForkEffect(effect, fiber, fiberContext, daemon) ->
+                                attachFork currentFiberContext fiberContext daemon
+                                Task.Run(fun () -> this.RunFiber effect fiberContext :> Task) |> ignore
                                 processOutcome
                                     &state
                                     onSuccessComplete
@@ -118,10 +102,7 @@ type DirectRuntime() =
                             | HandleJoinFiber fiberContext ->
                                 try
                                     let! value =
-                                        if state.InterruptionSuppressed > 0 then
-                                            fiberContext.Task
-                                        else
-                                            fiberContext.Task.WaitAsync currentFiberContext.CancellationToken
+                                        awaitedTask fiberContext.Task state.InterruptionSuppressed currentFiberContext
                                     processResult
                                         &state
                                         onSuccessComplete
@@ -134,11 +115,7 @@ type DirectRuntime() =
                                         &state
                                         onSuccessComplete
                                         onErrorComplete
-                                        (OutcomeInterrupted (FiberInterruptedException(
-                                            currentFiberContext.Id,
-                                            ExplicitInterrupt,
-                                            "Fiber was interrupted while blocked on a fiber join."
-                                        )))
+                                        (OutcomeInterrupted (interruptionFor currentFiberContext "Fiber was interrupted while blocked on a fiber join."))
                             | HandleJoinFirst fiberContexts ->
                                 let contexts = List.toArray fiberContexts
                                 try
@@ -162,11 +139,7 @@ type DirectRuntime() =
                                         &state
                                         onSuccessComplete
                                         onErrorComplete
-                                        (OutcomeInterrupted (FiberInterruptedException(
-                                            currentFiberContext.Id,
-                                            ExplicitInterrupt,
-                                            "Fiber was interrupted while blocked on a fiber join."
-                                        )))
+                                        (OutcomeInterrupted (interruptionFor currentFiberContext "Fiber was interrupted while blocked on a fiber join."))
                             | HandleJoinAllFailFast fiberContexts ->
                                 match tryCompleteJoinAll fiberContexts with
                                 | ValueSome outcome ->
@@ -195,18 +168,11 @@ type DirectRuntime() =
                                             &state
                                             onSuccessComplete
                                             onErrorComplete
-                                            (OutcomeInterrupted (FiberInterruptedException(
-                                                currentFiberContext.Id,
-                                                ExplicitInterrupt,
-                                                "Fiber was interrupted while blocked on a fiber join."
-                                            )))
+                                            (OutcomeInterrupted (interruptionFor currentFiberContext "Fiber was interrupted while blocked on a fiber join."))
                             | HandleAwaitTask(task, onError) ->
                                 try
                                     let! value =
-                                        if state.InterruptionSuppressed > 0 then
-                                            task
-                                        else
-                                            task.WaitAsync currentFiberContext.CancellationToken
+                                        awaitedTask task state.InterruptionSuppressed currentFiberContext
                                     processOutcome
                                         &state
                                         onSuccessComplete
@@ -219,54 +185,33 @@ type DirectRuntime() =
                                         &state
                                         onSuccessComplete
                                         onErrorComplete
-                                        (OutcomeInterrupted (FiberInterruptedException(
-                                            currentFiberContext.Id,
-                                            ExplicitInterrupt,
-                                            "Task has been cancelled."
-                                        )))
+                                        (OutcomeInterrupted (interruptionFor currentFiberContext "Task has been cancelled."))
                                 | ex ->
                                     processOutcome
                                         &state
                                         onSuccessComplete
                                         onErrorComplete
-                                        (OutcomeFailed (onError ex))
+                                        (awaitTaskFailureOutcome currentFiberContext onError ex)
                 return result.Value
             finally
                 ContStackPool.Return state.ContStack
         }
 
+    // The only call to InterpretAsync from outside itself. A fork is a concurrent hand-off, so it
+    // can never be a tail call; keeping it here is what lets [<TailCall>] guard InterpretAsync.
+    member private this.RunFiber (effect: FIO<obj, obj>) (fiberContext: FiberContext) =
+        task {
+            try
+                let! value = this.InterpretAsync effect fiberContext
+                fiberContext.Complete value
+            with ex ->
+                fiberContext.Complete <| Error(defectError fiberContext ex)
+        }
+
+    /// Schedules the given effect on a new fiber and returns immediately with a handle to it. Safe to
+    /// call concurrently and as often as you like: it never waits for, interrupts, or discards any
+    /// fiber already running on this runtime.
     override this.Run<'A, 'E> (effect: FIO<'A, 'E>) : Fiber<'A, 'E> =
-        lock runLock <| fun () ->
-            match currentFiber with
-            | Some fiberContext when not (fiberContext.IsTerminal()) ->
-                fiberContext.Task.GetAwaiter().GetResult() |> ignore
-            | _ -> ()
-
-            match currentFiber with
-            | Some fiberContext -> fiberContext.Cancel()
-            | None -> ()
-
-            let fiber = new Fiber<'A, 'E>()
-            currentFiber <- Some fiber.Context
-
-            let task =
-                task {
-                    let! value = this.InterpretAsync (effect.UpcastBoth()) fiber.Context
-                    fiber.Context.Complete value
-                }
-
-            task.ContinueWith(
-                (fun (task: Task) ->
-                    if task.IsFaulted then
-                        let ex: exn =
-                            match task.Exception with
-                            | null ->
-                                upcast InvalidOperationException "DirectRuntime task faulted without exception."
-                            | aggr when aggr.InnerExceptions.Count = 1 ->
-                                aggr.InnerExceptions[0]
-                            | aggr ->
-                                upcast aggr
-                        fiber.Context.Complete(Error(box ex))),
-                TaskContinuationOptions.OnlyOnFaulted) |> ignore
-
-            fiber
+        let fiber = new Fiber<'A, 'E>()
+        Task.Run(fun () -> this.RunFiber (effect.UpcastBoth()) fiber.Context :> Task) |> ignore
+        fiber

@@ -12,6 +12,8 @@ type InterruptionCause =
     | InvalidArgument of argumentName: string * reason: string
     /// The fiber was interrupted because a resource was exhausted.
     | ResourceExhaustion of reason: string
+    /// The fiber died because user code threw an exception that could not be reported as a typed error.
+    | Defect of ex: exn
 
     override this.ToString () =
         match this with
@@ -19,6 +21,7 @@ type InterruptionCause =
         | ExplicitInterrupt -> "ExplicitInterrupt"
         | InvalidArgument(arg, reason) -> $"InvalidArgument ({arg}: {reason})"
         | ResourceExhaustion reason -> $"ResourceExhaustion ({reason})"
+        | Defect ex -> $"Defect ({ex.GetType().Name}: {ex.Message})"
 
 /// Raised inside a fiber to interrupt it, carrying the interrupted fiber's id, the cause, and a message.
 exception FiberInterruptedException of fiberId: Guid * cause: InterruptionCause * message: string with

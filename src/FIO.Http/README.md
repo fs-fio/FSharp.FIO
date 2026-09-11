@@ -6,10 +6,10 @@
 
 HTTP server for [FIO](https://github.com/fs-fio/fio), built on [Kestrel](https://learn.microsoft.com/aspnet/core/fundamentals/servers/kestrel).
 Routes and handlers are plain values you compose, so an endpoint is a description you build
-up and hand to the server — errors surface as a typed `HttpError`, never raw exceptions.
+up and hand to the server.
 
 - **Composable routes** — build a routing table with `get` / `post` and the `++` operator
-- **Functional handlers** — `HttpRequest -> FIO<HttpResponse, HttpError>`, with JSON and text helpers
+- **Functional handlers** — `HttpRequest -> FIO<HttpResponse, exn>`, with JSON and text helpers
 - **Middleware** — attach cross-cutting behavior with `@@` (e.g. `Middleware.before`)
 - **Path & query parameters** — typed access to request data
 
@@ -22,20 +22,33 @@ dotnet add package FSharp.FIO.Http
 ## Quick Start
 
 ```fsharp
+open FIO.App
 open FIO.Http
 open FIO.Http.SimpleRoutes
 open FIO.Http.RoutesOperators
 
-let routes =
-    get "/" (HttpHandler.text "Hello!")
-    ++ get "/json" (HttpHandler.okJson {| msg = "Hello" |})
+type App() =
+    inherit FIOApp<unit, exn>()
 
-Server.runServer ServerConfig.defaultConfig routes
+    override _.effect =
+        let routes =
+            get "/" (HttpHandler.text "Hello!")
+            ++ get "/json" (HttpHandler.okJson {| msg = "Hello" |})
+
+        Server.runServer ServerConfig.defaultConfig routes
+
+[<EntryPoint>]
+let main _ = App().Run()
 ```
 
 ## Handlers & middleware
 
 ```fsharp
+open System
+open FIO.DSL
+open FIO.Http
+open FIO.Http.SimpleRoutes
+open FIO.Http.RoutesOperators
 open FIO.Http.MiddlewareOperators
 
 // Read the 'n' query parameter and return its square, validating the input.
@@ -56,14 +69,25 @@ let routes =
     get "/" (HttpHandler.text "Hello!")
     ++ get "/square" squareHandler
 
-Server.runServer ServerConfig.defaultConfig (routes @@ logging)
+// Attach the middleware and hand the result to FIOApp's `effect`, as in Quick Start.
+let server = Server.runServer ServerConfig.defaultConfig (routes @@ logging)
 ```
 
 ## Errors
 
-Operations fail with a typed `HttpError` — `InvalidRoute`, `ParsingFailed`, `HandlerFailed`,
-`MiddlewareFailed`, `ServerFailed`, `BodyReadFailed`, `JsonFailed`, `TimeoutError`, `GeneralError`
-— with `HttpError.fromException` / `HttpError.toException` to bridge raw exceptions.
+The server pipeline is typed as `Routes<exn>`, so a handler is `HttpRequest -> FIO<HttpResponse, exn>`
+and a handler that fails becomes a `500`. To model failures precisely *inside* a handler, use the
+`HttpError` union — `InvalidRoute`, `ParsingFailed`, `HandlerFailed`, `MiddlewareFailed`,
+`ServerFailed`, `BodyReadFailed`, `JsonFailed`, `TimeoutError`, `GeneralError` — and map back to
+`exn` at the edge:
+
+```fsharp
+let handler request =
+    (businessLogic request)              // FIO<HttpResponse, HttpError>
+        .MapError HttpError.toException  // FIO<HttpResponse, exn>
+```
+
+`HttpError.fromException` bridges the other way.
 
 ## Links
 

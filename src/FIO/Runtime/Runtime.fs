@@ -3,6 +3,7 @@ namespace FIO.Runtime
 open FIO.DSL
 
 open System
+open System.Threading
 open System.Collections.Generic
 
 module internal WorkerRuntimeDefaults =
@@ -82,6 +83,7 @@ type internal WorkItemPool private () =
 
     static member inline Return (workItem: WorkItem) =
         let mutable pool = WorkItemPool.pool
+
         if isNull pool then
             pool <- Stack<WorkItem>()
             WorkItemPool.pool <- pool
@@ -93,33 +95,29 @@ type internal WorkItemPool private () =
             workItem.InterruptionSuppressed <- 0
             pool.Push workItem
 
-// A lock-based work-stealing deque. The owning worker pushes/pops at the bottom (LIFO, so the
-// freshest item — e.g. a just-unblocked reader — is reclaimed first), while other workers steal
-// from the top (FIFO). The lock (rather than a lock-free Chase-Lev deque) is deliberate: FIO's
-// workers run as async continuations that hop threads, so "owner" operations are not single-threaded
-// and require mutual exclusion. Capacity must be a power of two.
 type internal WorkStealingDeque(initialCapacity: int) =
     let mutable items: WorkItem[] = Array.zeroCreate initialCapacity
+
     let mutable mask = initialCapacity - 1
+
     let mutable bottom = 0
+
     let mutable top = 0
+
     let gate = obj ()
 
     member _.IsEmpty =
-        System.Threading.Monitor.Enter gate
+        Monitor.Enter gate
         try
             bottom = top
         finally
-            System.Threading.Monitor.Exit gate
+            Monitor.Exit gate
 
-    // A lock-free, best-effort emptiness check used to skip locking idle deques while stealing. A
-    // stale read can only cause a missed steal opportunity (recovered by another thief or the
-    // backstop), never incorrect behaviour.
     member _.IsEmptyApprox =
         bottom = top
 
     member _.PushBottom (workItem: WorkItem) =
-        System.Threading.Monitor.Enter gate
+        Monitor.Enter gate
         try
             if bottom - top >= items.Length then
                 let count = bottom - top
@@ -133,10 +131,10 @@ type internal WorkStealingDeque(initialCapacity: int) =
             items.[bottom &&& mask] <- workItem
             bottom <- bottom + 1
         finally
-            System.Threading.Monitor.Exit gate
+            Monitor.Exit gate
 
     member _.TryPopBottom (workItem: byref<WorkItem>) =
-        System.Threading.Monitor.Enter gate
+        Monitor.Enter gate
         try
             if bottom = top then
                 false
@@ -146,10 +144,10 @@ type internal WorkStealingDeque(initialCapacity: int) =
                 items.[bottom &&& mask] <- Unchecked.defaultof<_>
                 true
         finally
-            System.Threading.Monitor.Exit gate
+            Monitor.Exit gate
 
     member _.TrySteal (workItem: byref<WorkItem>) =
-        System.Threading.Monitor.Enter gate
+        Monitor.Enter gate
         try
             if bottom = top then
                 false
@@ -159,7 +157,7 @@ type internal WorkStealingDeque(initialCapacity: int) =
                 top <- top + 1
                 true
         finally
-            System.Threading.Monitor.Exit gate
+            Monitor.Exit gate
 
 /// Base class for a FIO runtime that runs effects into fibers.
 [<AbstractClass>]
@@ -174,7 +172,9 @@ type FIORuntime internal () =
     default this.ConfigString =
         this.Name
 
-    /// Runs the given effect, returning a fiber for its eventual result.
+    /// Schedules the given effect on a new fiber and returns immediately with a handle to it. Safe to
+    /// call concurrently and as often as you like — for example once per request in a server — because
+    /// it never waits for, interrupts, or discards any fiber already running on this runtime.
     abstract member Run<'A, 'E> : FIO<'A, 'E> -> Fiber<'A, 'E>
 
     /// Returns a filesystem-safe form of this runtime's configuration string.

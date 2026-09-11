@@ -318,15 +318,15 @@ type Socket internal (netSocket: Sockets.Socket, config: SocketConfig) =
         with _ ->
             false
 
-    /// Gets the remote endpoint this socket is connected to.
+    /// Returns an effect that yields the remote endpoint this socket is connected to.
     member _.GetRemoteEndPoint () =
         attempt <| fun () -> netSocket.RemoteEndPoint
 
-    /// Gets the local endpoint this socket is bound to.
+    /// Returns an effect that yields the local endpoint this socket is bound to.
     member _.GetLocalEndPoint () =
         attempt <| fun () -> netSocket.LocalEndPoint
 
-    /// Gets the configuration this socket was created with.
+    /// The configuration this socket was created with.
     member _.GetConfig () =
         config
 

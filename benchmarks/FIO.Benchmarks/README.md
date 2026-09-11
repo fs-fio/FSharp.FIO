@@ -145,13 +145,36 @@ FIO_BENCH_RUNTIMES="WorkStealing-12-200-1" FIO_BENCH_FORK_ACTORS="5000,25000" \
 
 ## Interpreting results
 
-- **Runtime crossover:** at small parameter sizes `DirectRuntime` (built on .NET tasks) often
-  *outperforms* the fiber runtimes, whose fixed scheduling overhead dominates when there is little work.
-  the fiber runtimes (`PollingRuntime` / `SignalingRuntime` / `WorkStealingRuntime`) are designed to win
-  at scale — compare runtimes at realistic (large) parameter sizes, not at smoke-test sizes.
-- **Direct + huge fork counts:** a large `FIO_BENCH_FORK_ACTORS` (e.g. `50000`) spawns one .NET task per
-  actor under `Direct` and is correspondingly heavy on time/memory. Lower the count when profiling
-  `Direct`, or focus large fork runs on the fiber runtimes.
+- **Runtime ranking is not a size crossover.** A full 112-case sweep (all 12 workloads × every
+  parameter combination × all four runtimes, 30 measured iterations, M4 Max / .NET 10.0.400) gives
+  these geometric-mean speedups against `Direct` — above 1.00× is faster than `Direct`:
+
+  | Runtime | smallest params | largest params | overall | faster than `Direct` in |
+  |---------|:---------------:|:--------------:|:-------:|:-----------------------:|
+  | `Polling-12-200-1` | 0.63× | 0.61× | **0.60×** | 8 / 28 cases |
+  | `Signaling-12-200-1` | 0.72× | 0.71× | **0.68×** | 6 / 28 cases |
+  | `WorkStealing-12-200-1` | 1.18× | 1.26× | **1.20×** | 23 / 28 cases |
+
+  `WorkStealing` already beats `Direct` at smoke-test sizes and extends its lead at scale, so there is
+  no size threshold below which it should be discounted. `Polling` and `Signaling` are net *slower*
+  than `Direct` at both ends and essentially flat in between — they do not "win at scale", and
+  restricting the comparison to large parameter sizes will not show them in a better light. Their
+  worst case is **Threadring** (`Polling` 0.16×, `Signaling` 0.33×): a ring hands off strictly
+  sequentially, so there is one runnable fiber at a time and no parallelism to offset the park/wake
+  cost. Both remain useful as comparison runtimes; neither is a recommendation.
+- **Direct + huge fork counts:** a large `FIO_BENCH_FORK_ACTORS` (e.g. `50000`) spawns one .NET task
+  per actor under `Direct`. Measured, this is *not* a handicap — at 50 000 fibers `Direct` is both the
+  fastest and the lightest runtime in the set:
+
+  | Fibers | `Direct` | `Polling` | `Signaling` | `WorkStealing` |
+  |-------:|---------:|----------:|------------:|---------------:|
+  | 1 000 | 1.48 ms / 2.4 MB | 1.88 ms / 3.7 MB | 2.01 ms / 3.8 MB | 1.25 ms / 3.7 MB |
+  | 10 000 | 13.8 ms / 24 MB | 21.9 ms / 40 MB | 22.4 ms / 40 MB | 13.3 ms / 39 MB |
+  | 50 000 | **60.3 ms / 120 MB** | 104 ms / 201 MB | 108 ms / 203 MB | 62.1 ms / 197 MB |
+
+  `WorkStealing`'s lead on Fork *shrinks* with scale rather than growing — 1.18× at 1 000 fibers,
+  1.04× at 10 000, 0.97× at 50 000. Mass fiber creation is the one axis where the .NET thread pool is
+  the thing to beat, so keep the large counts in the sweep: they are the interesting part.
 - **Allocations and boxing:** every benchmark except **Big** passes `int` messages, which the channel
   implementation boxes to `obj`. The `Allocated` column therefore includes per-message boxing as well as
   scheduling allocations; **Big** uses reference-typed messages and does not box.
