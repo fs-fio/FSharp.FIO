@@ -8,8 +8,10 @@ WebSockets for [FIO](https://github.com/fs-fio/fio). Open connections, send fram
 match on incoming messages as composable effects — connections are scoped and released for you,
 and failures surface as a typed `WsError` rather than raw exceptions.
 
-- **Client** — `WebSocketClient.connectDefault` opens a scoped connection
-- **Server** — `WebSocketServer.start` / `acceptDefault` / `close` to accept clients
+- **Client** — `WebSocketClient.connectDefault` opens a connection (dispose it with `use!`), or
+  `withConnectionString` scopes it and closes it for you
+- **Server** — `WebSocketServer.start` / `acceptDefault` / `close` for manual control, or
+  `WebSocketServer.serve` / `acceptLoop` to run a handler per connection, stopping the listener when interrupted
 - **Typed messages** — match on `Frame(Text …)` / `Frame(Binary …)` / `ConnectionClosed`
 - **Custom codecs** — send and receive typed payloads
 

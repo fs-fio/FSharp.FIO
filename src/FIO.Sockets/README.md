@@ -9,7 +9,8 @@ effects — connections are scoped and released for you, and failures surface as
 `SocketError` rather than raw exceptions.
 
 - **Client connections** — `SocketClient.withConnectionTo` / `withConnection` scope a socket's lifetime
-- **Server** — `ServerSocket.bind` / `accept` / `close` to serve clients
+- **Server** — `ServerSocket.bind` / `accept` / `close` for manual control, or `ServerSocket.serve` /
+  `acceptLoop` to run a handler per connection with bounded concurrency, closing the server when interrupted
 - **Custom codecs** — send and receive typed messages, not just strings
 
 ## Install
@@ -50,10 +51,12 @@ let server = fio {
 
 ## Errors
 
-Operations fail with a typed `SocketError` — including `ConnectionFailed`, `ConnectionClosed`,
-`SendFailed`, `ReceiveFailed`, `TimeoutError`, `BindFailed`, `AcceptFailed`, `CodecError`,
-`GeneralError` — with `SocketError.fromException` / `SocketError.toException` to bridge raw
-exceptions.
+Operations fail with a typed `SocketError` — `ConnectionFailed`, `ConnectionClosed`, `SendFailed`,
+`ReceiveFailed`, `TimeoutError`, `BufferOverflow`, `InvalidState`, `BindFailed`, `AcceptFailed`,
+`CodecError`, `GeneralError` — with `SocketError.fromException` / `SocketError.toException` to
+bridge raw exceptions. `InvalidState` also covers argument validation (an empty host, a port out
+of range, a non-positive buffer size); `BufferOverflow` is raised when a line or frame exceeds the
+buffer you passed.
 
 Connection pooling is not implemented yet: `SocketPoolConfig` and the `PoolExhausted` / `PoolClosed`
 error cases are reserved for it and are not produced by any current operation.

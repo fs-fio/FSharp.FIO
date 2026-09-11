@@ -62,12 +62,13 @@ interrupted automatically on the first failure.
 open FIO.DSL
 
 // Run two effects in parallel with <&> and collect both results as a tuple.
-let taskA = FIO.succeed "Task A completed! ✅"
-let taskB = FIO.succeed (200, "Task B OK ✅")
-let both  = taskA <&> taskB
+let taskA: FIO<string, exn> = FIO.succeed "Task A completed! ✅"
+let taskB: FIO<int * string, exn> = FIO.succeed (200, "Task B OK ✅")
+let both = taskA <&> taskB
 
 // Or fork/join explicitly.
-let forked = FIO.succeed("Hello, concurrency! 🚀").Fork() >>= fun fiber -> fiber.Join()
+let forked: FIO<string, exn> =
+    FIO.succeed("Hello, concurrency! 🚀").Fork() >>= fun fiber -> fiber.Join()
 ```
 
 More in [examples/](https://github.com/fs-fio/fio/tree/main/examples) — the DSL, App, HTTP, Sockets, and WebSockets tours.

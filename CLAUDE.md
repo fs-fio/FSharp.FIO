@@ -11,7 +11,7 @@ FIO is a type-safe, purely functional effect system for F#. IO monad + fibers (g
 
 **Target:** .NET 10, F# 10, `.slnx` solution format (`FIO.slnx`). SDK pinned to `10.0.400` via `global.json` (`rollForward: latestMinor`).
 
-Repository: <https://github.com/fs-fio/fio> · License: MIT · Baseline version: `0.2.2-beta` (single source of truth in `Directory.Build.props`).
+Repository: <https://github.com/fs-fio/fio> · License: MIT · Baseline version: `0.3.0-beta` (single source of truth in `Directory.Build.props`).
 
 ## Build Commands
 
@@ -222,7 +222,7 @@ Macro benchmarks live in `benchmarks/FIO.Benchmarks/` (BenchmarkDotNet 0.15.8). 
 
 ## Testing
 
-- **Expecto + FsCheck** for property-based testing; test runner config: `Parallel`, `Summary`, `Colours 256`. Pinned versions (`Directory.Packages.props`): Expecto 11.1.0, FsCheck 3.3.3.
+- **Expecto + FsCheck** for property-based testing; test runner config: `Parallel`, `Summary`, `Colours 256`. Pinned versions (`Directory.Packages.props`): Expecto 11.1.0, FsCheck 3.4.0.
 - `tests/FIO.Tests/Utils/Utilities.fs` is the single source of runtime test helpers: `allRuntimes()`, `testAllRuntimes`, `testAllRuntimesSequenced` (for `System.Console`'s process-global state), and the FsCheck `Generators` `Arb`. All of them cover **all four** runtimes — `DirectRuntime`, `PollingRuntime`, `SignalingRuntime`, `WorkStealingRuntime`. Do not redefine these per test file: a helper named "all runtimes" that quietly omits one is how a runtime-specific defect survives a green suite
 - They share one `testConfig` (`EvaluationWorkers = 2`), not `WorkerConfig.Default`. `allRuntimes()` is called once per test list and the runtimes are never disposed, so the default (`ProcessorCount - 2`) would spawn thousands of threads and make wall-clock deadline assertions flake under load. Stress tests build their own runtimes with an explicit config
 - `tests/FIO.Tests/Runtime/ConformanceTests.fs` asserts the four runtimes are observationally equivalent — defect paths, typed-error integrity, `Await`/`UnsafeResult` agreement, `RunConcurrent`. It deliberately uses `'E = string`, because `Fiber.Task()` casts the error channel with `error :?> 'E`: a non-`'E` value there raises `InvalidCastException`, which `'E = exn` silently absorbs
@@ -236,7 +236,7 @@ Macro benchmarks live in `benchmarks/FIO.Benchmarks/` (BenchmarkDotNet 0.15.8). 
 - Core tests use `Generators` type for FsCheck Arb across all 4 runtimes; extension tests use `testAllRuntimes` helper wrapping `testSequenced`
 - `InternalsVisibleTo("FIO.Tests")` is set on the core project only (extension libs do not expose internals to tests)
 - All WebSocket test files are enabled in the `.fsproj` (including `WebSocketServerTests.fs`); the suite passes (no hang)
-- Stack-safety canaries live in `tests/FIO.Tests/DSL/FIOTests.fs` — the three "Stack safety - deep left-chained FlatMap/CatchAll/Ensuring" tests at depth 10000 are load-bearing for the iterative-flattening design of `UpcastResult`/`UpcastError`/`UpcastBoth`. Do not "simplify" those methods to plain recursion.
+- Stack-safety canaries live in `tests/FIO.Tests/DSL/FIOTests.fs` — the four "Stack safety - deep left-chained FlatMap/CatchAll/Ensuring/MapBoth" tests at depth 10000 are load-bearing for the iterative-flattening design of `UpcastResult`/`UpcastError`/`UpcastBoth`. Do not "simplify" those methods to plain recursion.
 
 ## Semantic Invariants (Do Not Break)
 
@@ -312,7 +312,7 @@ Keep doc comments well-formed XML: rephrase types out of prose ("an effect") or 
 - **`.editorconfig`** governs formatting: UTF-8, LF line endings, final newline, trim trailing whitespace (except `*.md`). 4-space indent for F# (`*.fs/fsi/fsx`) and project files (`*.fsproj/props/targets/slnx`); 2-space for JSON/YAML.
 - **`TreatWarningsAsErrors=true`** — set once in `Directory.Build.props`, applies to every project. Fix all warnings. Use `TreatWarningsAsErrors`, **not** `WarningsAsErrors` (the F# SDK reads the latter as a warning-number list).
 - **XML docs:** packable libraries set `GenerateDocumentationFile=true` and `WarnOn 3390`, so malformed doc XML fails the build.
-- **Central Package Management:** all package versions are pinned in `Directory.Packages.props` (e.g. FSharp.Core 10.1.301, BenchmarkDotNet 0.15.8). FSharp.Core's implicit reference is disabled in favor of an explicit, version-less `PackageReference` so the central version wins.
+- **Central Package Management:** all package versions are pinned in `Directory.Packages.props` (e.g. FSharp.Core 10.1.401, BenchmarkDotNet 0.15.8). FSharp.Core's implicit reference is disabled in favor of an explicit, version-less `PackageReference` so the central version wins.
 - **Versioning:** the baseline `<Version>` lives once in `Directory.Build.props`; the publish workflow overrides it from the git tag. Only the four `src/` libraries are packable (`IsPackable`); tests/benchmarks/examples are not.
 
 ## Important Notes

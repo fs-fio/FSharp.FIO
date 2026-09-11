@@ -22,20 +22,33 @@ dotnet add package FSharp.FIO.Http
 ## Quick Start
 
 ```fsharp
+open FIO.App
 open FIO.Http
 open FIO.Http.SimpleRoutes
 open FIO.Http.RoutesOperators
 
-let routes =
-    get "/" (HttpHandler.text "Hello!")
-    ++ get "/json" (HttpHandler.okJson {| msg = "Hello" |})
+type App() =
+    inherit FIOApp<unit, exn>()
 
-Server.runServer ServerConfig.defaultConfig routes
+    override _.effect =
+        let routes =
+            get "/" (HttpHandler.text "Hello!")
+            ++ get "/json" (HttpHandler.okJson {| msg = "Hello" |})
+
+        Server.runServer ServerConfig.defaultConfig routes
+
+[<EntryPoint>]
+let main _ = App().Run()
 ```
 
 ## Handlers & middleware
 
 ```fsharp
+open System
+open FIO.DSL
+open FIO.Http
+open FIO.Http.SimpleRoutes
+open FIO.Http.RoutesOperators
 open FIO.Http.MiddlewareOperators
 
 // Read the 'n' query parameter and return its square, validating the input.
@@ -56,7 +69,8 @@ let routes =
     get "/" (HttpHandler.text "Hello!")
     ++ get "/square" squareHandler
 
-Server.runServer ServerConfig.defaultConfig (routes @@ logging)
+// Attach the middleware and hand the result to FIOApp's `effect`, as in Quick Start.
+let server = Server.runServer ServerConfig.defaultConfig (routes @@ logging)
 ```
 
 ## Errors
